@@ -1,6 +1,6 @@
 """
 Main GUI entry point. Run this directly: python gui_app.py
-Tab 1 (Settings & Configuration), tab 2 (Scan), and tab 3 (Debug) are all wired up:
+Tab 1 (Settings & Configuration), tab 2 (Scan), tab 3 (Debug), and tab 4 (Analysis) are all wired up:
 geometry edits in tab 1 live-update tab 2's preview, and switching to tab 2 always
 refreshes it too.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from analysis_tab import AnalysisTab
 from branding import APP_NAME, load_kiss_mark_image
 from debug_tab import DebugTab
 from scan_tab import ScanTab
@@ -20,7 +21,7 @@ class ScanApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x800")
+        self.geometry("1200x860")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Keep a reference on self — PhotoImage is garbage-collected otherwise.
@@ -43,11 +44,19 @@ class ScanApp(tk.Tk):
         self.debug_tab = DebugTab(notebook, self.settings_tab)
         notebook.add(self.debug_tab, text="Debug")
 
+        self.analysis_tab = AnalysisTab(notebook, self.settings_tab)
+        notebook.add(self.analysis_tab, text="Analysis")
+
         # Live-link the two tabs: geometry edits refresh the plot immediately, and
         # switching to the Scan tab refreshes it too (covers Load Settings / Reset,
         # which change many fields at once rather than firing key-by-key events).
         self.settings_tab.on_geometry_change = self.scan_tab.refresh_preview
-        notebook.bind("<<NotebookTabChanged>>", lambda e: self.scan_tab.refresh_preview())
+        notebook.bind("<<NotebookTabChanged>>", lambda e: self._on_tab_changed(notebook))
+
+    def _on_tab_changed(self, notebook) -> None:
+        self.scan_tab.refresh_preview()
+        if notebook.select() == str(self.analysis_tab):
+            self.analysis_tab.on_shown()
 
     def _on_close(self) -> None:
         self.debug_tab.close()

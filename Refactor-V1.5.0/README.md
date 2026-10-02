@@ -1,5 +1,10 @@
 # Array Scan Project
 
+**Version 1.5.0.** Same code as the 1.4.16 build, renumbered: the settings reorganisation and the
+Analysis tab are new features, so this is a minor-version step. Version numbers follow MAJOR.MINOR.PATCH
+from here on: breaking changes (old presets, data files or calibrations no longer valid) bump
+MAJOR, new features bump MINOR, and bug fixes bump PATCH.
+
 ## Files
 
 - `config.py` — all experiment settings (dataclasses)
@@ -25,6 +30,8 @@
 - `settings_tab.py` — GUI tab 1: Settings & Configuration (`SettingsTab`)
 - `scan_tab.py` — GUI tab 2: Scan (`ScanTab`) — live geometry preview, progress bar, Start/Stop
 - `debug_tab.py` — GUI tab 3: Debug (`DebugTab`) — manual stage jog + board-wide voltage set
+- `analysis.py` — dataset loading, time gating and phase/magnitude processing for the Analysis tab (adapted from `ElementToElementPTV.py`; no GUI code)
+- `analysis_tab.py` — GUI tab 4: Analysis (`AnalysisTab`) — board heatmap and per-element 2x2 plots
 - `gui_app.py` — GUI entry point; run this directly (`python gui_app.py`)
 
 ## Adding a new controller, stage, or VNA
@@ -82,7 +89,7 @@ amount of work (write 2 files, one push) regardless of whether the grid is unifo
 
 ## GUI
 
-`python gui_app.py` opens **Candice**, a three-tab window (Settings, Scan, Debug) (needs tkinter, which ships with
+`python gui_app.py` opens **Candice**, a four-tab window (Settings, Scan, Debug, Analysis) (needs tkinter, which ships with
 standard Python installs on Windows) with a lipstick-kiss logo in the header
 (`kiss_mark.png`, loaded via `branding.load_kiss_mark_image()`). This is a real desktop
 app, not a web page — it needs direct access to COM ports, local files, and SSH, none of
@@ -215,6 +222,48 @@ linking, tab-switch refresh, and a complete scan from Start through 100% through
 by extending the same fake-tkinter harness from before with a stub for matplotlib's
 Tk-specific canvas (the real `Figure`/`Axes` still does the actual plotting inside it) and
 actually running the real background thread to completion.
+
+## Analysis tab
+
+`analysis_tab.py` (widgets and drawing) and `analysis.py` (processing), adapted from
+`ElementToElementPTV.py`.
+
+1. **Dataset folder:** type or browse to a run folder and click **Load** (or press Enter). The box
+   starts with the current run's folder (output directory / run name from Settings). Loading and
+   processing run in the background with a progress bar: about 7 s for an L dataset and 14 s for H.
+   The line under the folder shows what was found, e.g. "1024 L elements, 6 voltages, 17-21 GHz".
+2. **Heatmap:** every element at its physical position, coloured by phase range across voltage,
+   phase at the last voltage (what the original script plotted), or magnitude range, at one of the
+   reference frequencies. Elements without enough measured voltages show grey.
+3. **Element plots:** click an element on the heatmap, or enter its row and column (0-indexed, as
+   in the file names; plus L/H if the folder has both) and press **Show**. The right side shows the
+   original script's 2x2 figure: phase and magnitude vs voltage at each reference frequency, and vs
+   frequency for each voltage. Each plot's legend sits outside it, to the right; when a plot has more
+than 10 lines (more than 10 reference frequencies, or more than 10 voltages), the lines are coloured
+by their actual value and a colour bar replaces the legend. **Save heatmap...** and **Save plot...**
+write PNG or PDF.
+4. **Processing options** (collapsed): reference frequencies, gate width (samples before/after the
+   time-domain peak) and Tukey alpha, then **Reprocess**. **Phase reference** (linear trend or first
+   voltage) reprocesses immediately.
+
+Differences from the original script: it works from the files' complex `sdata` (no magnitude/phase
+round trip); it uses each file's own frequency axis (16-24 GHz is only assumed for legacy files that
+don't record one); elements are keyed by density as well as row/column, since L and H row numbers
+overlap; only measured voltages are used, so a cancelled scan still loads; reference frequencies
+default per band (18-20 GHz for low band, 27-29 GHz for high band, 0.25 GHz apart; the original
+list's "19.75 GHz" and "20.0 GHz" entries both pointed at 19.5 GHz); and gating isn't rounded
+mid-calculation. Legacy files (`amplitudes`/`phases` keys, `C#R#` names) still load.
+
+Verified against the original script's own functions on the same element (phase within 0.001 deg,
+magnitude within 0.0001 dB, the difference being the original's rounding), and on synthetic
+datasets with a known phase shift per element plus a reflection the gate must remove: the heatmap
+recovers every element's phase range to 0.0003 deg. Tested end to end with real tkinter: L and H
+datasets, high band, a cancelled scan, legacy files, clicking and typed selection, invalid input,
+reprocessing, and saving.
+
+Figures are re-fitted to their widget's pixel size before each draw. Matplotlib can raise a figure's
+DPI after the window appears (to match display scaling), keeping its size in inches, which renders
+it wider than its widget and clips the right edge; this showed up as clipped plots during testing.
 
 ## Debug tab
 

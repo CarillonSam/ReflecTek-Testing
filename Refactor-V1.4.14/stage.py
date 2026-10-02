@@ -312,12 +312,21 @@ class HexGridPlanner:
         l_row = 0  # within-density counters — advance independently of physical dense_row
         h_row = 0
 
+        def is_offset(dense_row: int) -> bool:
+            return (dense_row % 2 == 1) if c.offset_odd_rows else (dense_row % 2 == 0)
+
+        # The origin (0, 0) is always the first L element (L row 0, col 0), whatever
+        # l_subgrid is: everything is shifted by that element's unshifted position. That
+        # makes the calibration origin and the scan origin the same, easy-to-find element,
+        # and means H points can never land on L elements even if l_subgrid is set wrong.
+        origin_x = c.stagger_sign * sub_spacing_mm / 2 if is_offset(l_phase) else 0.0
+        origin_y = dense_row_spacing_mm * l_phase
+
         for dense_row in range(total_dense_rows):
             density = "L" if (dense_row % 3) == l_phase else "H"
-            stage_y_mm = c.y_direction_sign * dense_row_spacing_mm * dense_row
+            stage_y_mm = c.y_direction_sign * (dense_row_spacing_mm * dense_row - origin_y) + 0.0
 
-            is_offset_row = (dense_row % 2 == 1) if c.offset_odd_rows else (dense_row % 2 == 0)
-            row_offset_mm = c.stagger_sign * sub_spacing_mm / 2 if is_offset_row else 0.0
+            row_offset_mm = c.stagger_sign * sub_spacing_mm / 2 if is_offset(dense_row) else 0.0
 
             logical_row = l_row if density == "L" else h_row
 
@@ -334,7 +343,7 @@ class HexGridPlanner:
                     x_loop=visit_index,
                     logical_row=logical_row,
                     logical_col=col,
-                    stage_x_mm=c.x_direction_sign * (col * sub_spacing_mm + row_offset_mm),
+                    stage_x_mm=c.x_direction_sign * (col * sub_spacing_mm + row_offset_mm - origin_x) + 0.0,
                     stage_y_mm=stage_y_mm,
                     density=density,
                 )
@@ -353,43 +362,40 @@ class HexGridPlanner:
 
     def calibration_targets(self) -> "CalibrationTargets":
         """
-        The three real elements the stage calibration nudges to, all in ideal
-        (planned) coordinates, so each target is something the operator can physically
-        line up on:
-          - origin:   the planner's (0, 0) element (first row, first column of the full
-                      grid). It's L when l_subgrid=1, otherwise H, but always real.
-          - x_corner: last element of the first L row (far end of X).
-          - y_corner: first element of the last L row (far end of Y).
-        The corners are taken from the actual generated L points, so the alternate-row
-        offset and the l_subgrid phase are already accounted for. They are generally
-        not on the axes, which is why calibrate_stage.calibrate solves a full 2x2
-        system rather than assuming axis-aligned corners.
+        The three L elements the stage calibration nudges to, in ideal coordinates:
+          - origin:   the first L element (L row 0, col 0), always at (0, 0).
+          - y_corner: the farthest L element straight down from the origin (x = 0). Only
+                      every other L row has an element on x = 0 (the rows in between are
+                      offset by half a pitch), so with 32 L rows this is L row 30.
+          - x_corner: the farthest L element straight across from the origin (y = 0): the
+                      last element of the first L row.
+        Both corners sit exactly on the axes, so each one measures one axis's scale and
+        the other axis's skew directly.
         """
-        points = self.all_points()
-        # Ideal (0, 0) is where calibration zeroes the stage. With the default
-        # offset_odd_rows=True an element sits exactly there; with offset_odd_rows=False
-        # row 0 is shifted and nothing does, so origin is None and the operator just
-        # lines up on the stage's (0, 0) reference instead.
-        origin = next((p for p in points if abs(p.stage_x_mm) < 1e-9 and abs(p.stage_y_mm) < 1e-9), None)
-        l_points = [p for p in points if p.density == "L"]
-        last_col = self.config.cols - 1
-        last_l_row = max(p.logical_row for p in l_points)
-        x_corner = next(p for p in l_points if p.logical_row == 0 and p.logical_col == last_col)
-        y_corner = next(p for p in l_points if p.logical_row == last_l_row and p.logical_col == 0)
+        tol = 1e-6
+        l_points = [p for p in self.all_points() if p.density == "L"]
+        origin = next(p for p in l_points if p.logical_row == 0 and p.logical_col == 0)
+        on_y_axis = [p for p in l_points if abs(p.stage_x_mm) < tol and p is not origin]
+        on_x_axis = [p for p in l_points if abs(p.stage_y_mm) < tol and p is not origin]
+        if not on_y_axis or not on_x_axis:
+            raise ValueError(
+                "Calibration needs at least 3 L rows and 2 columns, so there's an L element "
+                "straight down and straight across from the origin."
+            )
+        y_corner = max(on_y_axis, key=lambda p: abs(p.stage_y_mm))
+        x_corner = max(on_x_axis, key=lambda p: abs(p.stage_x_mm))
         return CalibrationTargets(origin=origin, x_corner=x_corner, y_corner=y_corner)
 
 
 @dataclass(frozen=True)
 class CalibrationTargets:
-    origin: ScanPoint | None
+    origin: ScanPoint
     x_corner: ScanPoint
     y_corner: ScanPoint
 
     @staticmethod
-    def describe(point: ScanPoint | None) -> str:
+    def describe(point: ScanPoint) -> str:
         """Human-readable label for a dialog: density, row/col within that density, position."""
-        if point is None:
-            return "stage reference (0.000, 0.000) mm (no element there)"
         return (
             f"{point.density} element row {point.logical_row + 1}, col {point.logical_col + 1} "
             f"at ({point.stage_x_mm + 0.0:.3f}, {point.stage_y_mm + 0.0:.3f}) mm"

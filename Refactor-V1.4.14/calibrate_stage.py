@@ -1,18 +1,17 @@
 """
-Interactive stage calibration. Walks through the nudge-to-element protocol: set an
-origin, then nudge onto a far-Y element and a far-X element, computing scale/skew
-coefficients from how far off "ideal" those elements were.
-
-The targets come from HexGridPlanner.calibration_targets(): the (0, 0) element, the
-last element of the first L row (far X), and the first element of the last L row
-(far Y). They're real elements taken from the generated grid, so each one is
-something you can physically line up on, with the alternate-row offset and the
-l_subgrid phase already included. Because those corners are generally not exactly on
-the axes, the coefficients come from solving a full 2x2 linear system rather than
-dividing by an axis span.
+Interactive stage calibration. Three steps, all on L elements:
+  1. Nudge the stage onto the first L element (L row 1, col 1). It becomes (0, 0).
+     There's no homing move first: calibration starts wherever the stage is.
+  2. The stage moves to the farthest L element straight down from it (same x); nudge
+     it into place.
+  3. The stage moves to the farthest L element straight across from it (same y), the
+     last element of the first L row; nudge it into place.
+Scale and skew come from how far those two corners were from ideal. At the end the
+stage is sent back to the first L element, so a scan started next begins at the same
+origin.
 
 Saves the result to StageConfig.calibration_file, so run_scan.py picks it up
-automatically on future runs via GrblXY.calibration — no need to recalibrate every time.
+automatically on future runs via GrblXY.calibration.
 
 Run this directly: python calibrate_stage.py
 Re-run it any time the stage, mount, or board is physically disturbed.
@@ -98,9 +97,10 @@ def calibrate(stage: GrblXY, targets: CalibrationTargets, parent=None) -> StageC
         root.withdraw()
         parent = root
     try:
-        stage.home_xy()
+        # No homing move: calibration starts wherever the stage is. The operator nudges it
+        # onto the first L element, and that spot becomes (0, 0) for calibration and scans.
         stage.set_software_zero_here()
-        _adjust(stage, 0.0, 0.0, f"the origin: {CalibrationTargets.describe(targets.origin)}", parent)
+        _adjust(stage, 0.0, 0.0, f"the first L element (the origin): {CalibrationTargets.describe(targets.origin)}", parent)
         stage.set_software_zero_here()  # re-zero on the user-nudged true origin
 
         actual_y = _adjust(stage, *ideal_y, f"the far-Y element: {CalibrationTargets.describe(targets.y_corner)}", parent)

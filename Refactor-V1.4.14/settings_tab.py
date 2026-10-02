@@ -396,8 +396,8 @@ class SettingsTab(ttk.Frame):
 
         if not messagebox.askyesno(
             "Calibrate stage",
-            "This homes the stage and walks through the nudge-to-element calibration "
-            "on the real hardware, with a dialog at each step. You'll line up on:\n\n"
+            "Calibration starts wherever the stage is now. A dialog at each step asks you to "
+            "nudge the stage onto an L element:\n\n"
             f"  Origin: {CalibrationTargets.describe(targets.origin)}\n"
             f"  Far Y:  {CalibrationTargets.describe(targets.y_corner)}\n"
             f"  Far X:  {CalibrationTargets.describe(targets.x_corner)}\n\n"

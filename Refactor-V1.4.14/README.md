@@ -263,40 +263,32 @@ to points via `stage.goto_ideal_xy(...)` / `stage.wait_until_reached_ideal(...)`
 apply this transform automatically — the scan loop itself never has to think about
 calibration at all.
 
-**Calibration targets are real elements (changed in V1.4.4).** `HexGridPlanner.calibration_targets()`
-picks three elements straight from the generated grid:
-- **Origin:** the planner's (0, 0) element (first row, first column of the full grid). It's an
-  L element when `l_subgrid=1` and an H element otherwise, but it is always a real element.
-- **Far X:** the last element of the first L row.
-- **Far Y:** the first element of the last L row.
+**Calibration protocol: three L elements, no homing.** Calibration starts wherever the stage is,
+and every target is an L element:
+1. **Origin: the first L element (L row 1, col 1).** Nudge the stage onto it; that spot becomes
+   (0, 0). The planner always puts this element at (0, 0), whatever the L sub-grid setting.
+2. **Far Y: the farthest L element straight down from the origin (x = 0).** Only every other L row
+   has an element on that line (the rows between are offset by half a pitch), so with 32 L rows
+   it's L row 31. At 4 mm spacing: (0, -180) mm.
+3. **Far X: the farthest L element straight across from the origin (y = 0)**, the last element of
+   the first L row. At 4 mm spacing: (-214.774, 0) mm.
 
-Before V1.4.4 the corners were computed as `(sign * (cols-1) * spacing, 0)` and
-`(0, sign * (rows-1) * row_spacing)`. The Y one didn't land on any element: the last L row is an
-offset row, so the nearest element was half a sub-grid pitch away in X. An operator lining up on the
-element they could see would record that offset as stage skew. With `l_subgrid` 2 or 3 the origin and
-X targets also landed on H elements rather than L. Taking targets from the generated points fixes all
-of that, because the alternate-row offset and the `l_subgrid` phase are already in their coordinates.
-The signs still matter and are still handled, since the targets carry whatever
-`x_direction_sign`/`y_direction_sign` the planner applied.
+Both corners are exactly on the axes, so each measures one axis's scale and the other axis's
+skew directly (`calibrate_stage.solve_calibration()` still solves the general 2x2 system, which
+reduces to that). At the end the stage is sent back to the first L element, so a scan started next
+begins at the same origin. Verified on the simulated stage, including starting 25 mm away from the
+first L element: the coefficients come back to about 2e-6.
 
-Because those corners are generally not on the axes, `calibrate_stage.solve_calibration()` solves the
-full 2x2 system `M @ ideal = actual` for both corners (origin fixed at 0, 0) instead of dividing by an
-axis span. For axis-aligned corners it reduces exactly to the old formulas. Verified by simulating a
-stage with a known scale and skew and an operator who nudges onto the true element: the coefficients
-come back exact (to floating-point precision) for all three `l_subgrid` values and both stagger
-directions.
-
-**To calibrate:** set the stage calibration file in General settings, then click **Calibrate Stage...** at the bottom of the Settings tab
-(needs a real stage connected). The confirmation dialog lists the three elements you'll line up on,
-by density, row/column, and ideal position, and each nudge dialog repeats which one it's waiting for.
-It connects using the current hidden stage config (port, baud, etc.) plus whatever path is in the
-Calibration file field, takes its targets from the current Scan Geometry fields, walks through home,
-origin, far Y, and far X, then saves `scale_x`/`skew_x`/`scale_y`/`skew_y` to that file. You can also
-run `calibrate_stage.py` directly as a standalone script (same `calibrate()` function, with a
-hardcoded config at the bottom of the file to edit). Either way, once saved, every future run using
-that same `calibration_file` path picks the correction up automatically. You only need to recalibrate
-if the stage, mount, or board gets physically disturbed, or you're switching to a different DUT that
-needs its own calibration file.
+**To calibrate:** set the stage calibration file in General settings, move the stage roughly over
+the first L element (the Debug tab works for this), then click **Calibrate Stage...** at the bottom
+of the Settings tab (needs a real stage connected). The confirmation dialog lists the three L
+elements you'll line up on, and each nudge dialog repeats which one it's waiting for. It uses the
+stage settings under Advanced, takes its targets from the current Scan Geometry fields, then saves
+`scale_x`/`skew_x`/`scale_y`/`skew_y` to the calibration file. You can also run `calibrate_stage.py`
+directly as a standalone script (same `calibrate()` function, with a hardcoded config at the bottom
+of the file to edit). Once saved, every future run using that same calibration file picks the
+correction up automatically. Recalibrate if the stage, mount, or board gets physically disturbed,
+or you're switching to a different DUT that needs its own calibration file.
 
 **Move timeouts and stage coordinates (fixed in V1.4.8).** Two bugs made calibration fail with
 "Stage did not reach target" while the stage was still moving:
@@ -461,6 +453,18 @@ exactly its own (point, voltage) trace, calibrated coordinates and
 the frequency axis are correct, a cancelled scan leaves earlier voltages intact with the rest NaN,
 a reused run name is refused, and a simulated disk error mid-write leaves the existing file loadable
 with its earlier data.
+
+## The origin and the L sub-grid
+
+**The origin is always the first L element** (L row 1, col 1), for calibration, scans, the Debug
+tab, and the saved `stage_x_mm`/`stage_y_mm`. The planner shifts the whole grid so that element is
+at (0, 0). With L sub-grid 1 nothing changes from V1.4.10; with 2 or 3 every position shifts by that
+element's old offset, and H rows above the first L row get positive coordinates.
+
+**L sub-grid** now only says how many H rows sit above the board's first L row: 1 = none (the
+board's first row is L), 2 = one, 3 = two. Because the origin is always on an L element, a wrong
+setting can no longer put H points on L elements (verified for every setting/board combination);
+it can only shift which H rows at the edges get scanned, and which H row is numbered 0.
 
 ## Notes
 

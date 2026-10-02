@@ -19,8 +19,8 @@ from controller import BoardController
 from data import DataSaver
 from pi_controller import PiBoardController
 from pixel_controller import PixelController
-from stage import HexGridPlanner, MotorStage, ScanPoint, GrblXY
-from vna import VNAController
+from stage import HexGridPlanner, MotorStage, ScanPoint, GrblXY, StageCalibration
+from vna import VNAController, VNAResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -136,34 +136,59 @@ class AutomatedArrayScanner:
         self.array.set_voltage_grid(self._single_point_grid(point, voltage_v))
         time.sleep(self.config.single_pixel_settle_s)
 
-    def measure_point(self, point: ScanPoint) -> np.ndarray:
+    def measure_point(self, point: ScanPoint) -> VNAResult:
         if self.config.dry_run:
-            return np.zeros(self.config.vna.points, dtype=np.complex128)
+            zeros = np.zeros(self.config.vna.points)
+            return VNAResult(sdata=zeros.astype(np.complex128), amplitude=zeros, phase_deg=zeros)
 
         assert self.stage is not None and self.vna is not None
         self.stage.goto_ideal_xy(point.stage_x_mm, point.stage_y_mm)
         self.stage.wait_until_reached_ideal(point.stage_x_mm, point.stage_y_mm)
-        return self.vna.trigger().sdata
+        return self.vna.trigger()
+
+    def _frequencies_hz(self) -> np.ndarray:
+        """The VNA's actual sweep (read back in initialize()), or the configured one in a dry run."""
+        if self.vna is not None and self.vna.frequencies_hz is not None:
+            return self.vna.frequencies_hz
+        c = self.config.vna
+        return np.linspace(c.start_hz, c.stop_hz, c.points)
+
+    def _calibration(self) -> StageCalibration:
+        """The correction actually applied to moves (identity if uncalibrated)."""
+        if self.stage is not None:
+            return self.stage.calibration
+        return StageCalibration.load_or_identity(self.config.stage.calibration_file)
 
     def run(self) -> None:
-        self.saver.save_metadata({
-            "config": asdict(self.config),
-            "active_points": [point.__dict__ for point in self.active_points],
-            "active_point_count": len(self.active_points),
-            "scan_mode": "uniform_board" if self.config.uniform_board_mode else "mapped_element",
-        })
-
-        voltage_count = len(self.config.voltages_v)
+        voltages_v = np.asarray(self.config.voltages_v, dtype=float)
+        voltage_count = len(voltages_v)
         point_count = len(self.active_points)
-        vna_points = self.config.vna.points
         total_steps = voltage_count * point_count
         step = 0
         cancelled = False
 
-        sdata_summary = self.saver.open_summary_arrays(point_count, voltage_count, vna_points)
-
         try:
             self.connect()
+            # Saved after connecting, so the frequency axis is what the VNA actually
+            # confirmed and the calibration is the one the stage actually loaded.
+            frequencies_hz = self._frequencies_hz()
+            calibration = self._calibration()
+            self.saver.save_metadata({
+                "config": asdict(self.config),
+                "scan_mode": "uniform_board" if self.config.uniform_board_mode else "mapped_element",
+                "density_mode": self.config.geometry.density_mode,
+                "voltages_v": voltages_v.tolist(),
+                "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
+                                   "points": int(len(frequencies_hz)), "spacing": "linear"},
+                "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                      "coefficients": calibration.to_dict()},
+                "file_layout": "one <density>_R<row>_C<col>.npz per coordinate; see data.py",
+                "active_point_count": point_count,
+                "active_points": [point.__dict__ for point in self.active_points],
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            sdata_summary = self.saver.open_summary_arrays(point_count, voltage_count, len(frequencies_hz))
+
             for v_idx, voltage_v in enumerate(self.config.voltages_v):
                 if cancelled:
                     break
@@ -180,8 +205,8 @@ class AutomatedArrayScanner:
                         break
 
                     logging.info(
-                        "Point %d/%d | row=%d col=%d | x=%.3f mm y=%.3f mm",
-                        p_idx + 1, point_count, point.logical_row, point.logical_col,
+                        "Point %d/%d | %s row=%d col=%d | x=%.3f mm y=%.3f mm",
+                        p_idx + 1, point_count, point.density, point.logical_row, point.logical_col,
                         point.stage_x_mm, point.stage_y_mm,
                     )
 
@@ -190,12 +215,15 @@ class AutomatedArrayScanner:
                     elif not self.config.uniform_board_mode:
                         self.program_voltage_for_point(point, voltage_v)
 
-                    sdata = self.measure_point(point)
+                    result = self.measure_point(point)
                     if sdata_summary is not None:
-                        sdata_summary[p_idx, v_idx, :] = sdata
+                        sdata_summary[p_idx, v_idx, :] = result.sdata
 
                     self.saver.save_point(
-                        point=point, voltage_v=voltage_v, voltage_index=v_idx, sdata=sdata,
+                        point=point, voltages_v=voltages_v, voltage_index=v_idx,
+                        sdata=result.sdata,
+                        frequencies_hz=frequencies_hz,
+                        physical_xy=calibration.transform(point.stage_x_mm, point.stage_y_mm),
                     )
 
                     step += 1
@@ -211,10 +239,8 @@ class AutomatedArrayScanner:
                      for p in self.active_points],
                     dtype=float,
                 )
-                self.saver.finalize_summary(
-                    voltages_v=np.asarray(self.config.voltages_v, dtype=float),
-                    active_points=active_points,
-                )
+                self.saver.finalize_summary(voltages_v=voltages_v, active_points=active_points,
+                                            frequencies_hz=frequencies_hz)
         finally:
             self.close()
 

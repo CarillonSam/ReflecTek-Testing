@@ -15,6 +15,13 @@ class StageConfig:
     readback_poll_s: float = 0.1
     startup_delay_s: float = 2.0
 
+    # How long wait_until_reached allows for each move: the move's own travel time at
+    # feed_mm_per_min, times move_timeout_factor, plus move_timeout_extra_s (covers
+    # acceleration and status-poll latency). Long diagonal moves get proportionally
+    # longer, so a big array or a slow feed can't time out while the stage is still moving.
+    move_timeout_factor: float = 1.5
+    move_timeout_extra_s: float = 10.0
+
     # JSON file with saved scale/skew calibration coefficients (see calibrate_stage.py).
     # If unset or the file doesn't exist yet, moves are uncalibrated (identity transform).
     calibration_file: Path | None = None
@@ -137,8 +144,12 @@ class PiControllerConfig:
 class SaveConfig:
     output_dir: Path = Path(r"C:\Data\ArrayScans")
     run_name: str = "scan_run"
+    # One .npz per visited coordinate, rewritten as each voltage is measured there
+    # (see data.py for the file layout).
     save_individual_npz: bool = True
-    save_summary_npz: bool = True
+    # Optional extra copy of every trace in one summary_sdata.npy array. Duplicates the
+    # per-coordinate files (doubles disk use), so off by default.
+    save_summary_npz: bool = False
     save_metadata_json: bool = True
 
 

@@ -44,6 +44,9 @@ class VNAController(VNAInstrument):
         self.config = config
         self.rm: Optional[pyvisa.ResourceManager] = None
         self.instr = None
+        # Frequency axis of the sweep, set by initialize() from the instrument's read-back
+        # start/stop/points (assumes a linear sweep).
+        self.frequencies_hz: Optional[np.ndarray] = None
 
     def _ensure_open(self) -> None:
         if self.instr is None:
@@ -95,6 +98,7 @@ class VNAController(VNAInstrument):
             "VNA readback: start=%.0f Hz (requested %.0f), stop=%.0f Hz (requested %.0f), points=%d (requested %d)",
             actual_start, c.start_hz, actual_stop, c.stop_hz, actual_points, c.points,
         )
+        self.frequencies_hz = np.linspace(actual_start, actual_stop, actual_points)
         if abs(actual_start - c.start_hz) > 1.0 or abs(actual_stop - c.stop_hz) > 1.0 or actual_points != c.points:
             raise RuntimeError(
                 "VNA accepted the commands (no SCPI error) but the readback doesn't match what was "

@@ -228,7 +228,7 @@ These moves bypass calibration deliberately — `goto_x`/`goto_y` are the raw st
 primitives, not `goto_ideal_xy`, since manual hardware debugging wants direct physical
 control, not the ideal-to-physical correction a scan applies. The voltage field calls
 `set_voltage_grid(np.array([[v]]))` — a 1x1 array still trips the uniform-grid fast path
-both controllers already have (see "Large scans and memory" — any single-value grid
+the pixel controller has (see "DAC mapping" — any single-value grid
 takes the broadcast-to-everything path, regardless of its logical shape), so it correctly
 sets every physical output with no need to reconstruct the real scan geometry here.
 
@@ -298,6 +298,30 @@ that same `calibration_file` path picks the correction up automatically. You onl
 if the stage, mount, or board gets physically disturbed, or you're switching to a different DUT that
 needs its own calibration file.
 
+**Move timeouts and stage coordinates (fixed in V1.4.8).** Two bugs made calibration fail with
+"Stage did not reach target" while the stage was still moving:
+
+1. `wait_until_reached` allowed a fixed 30 s for every move. At the default 500 mm/min (8.3 mm/s)
+   that cuts off any move longer than 250 mm. On a 4 mm, 32 x 32 grid, origin to far Y is about
+   186 mm (22 s, fine), but far Y to far X is a 281 mm diagonal (34 s), so calibration always died
+   on the second extent. The timeout is now sized to each move:
+   travel time at `stage.feed_mm_per_min` x `stage.move_timeout_factor` (1.5) +
+   `stage.move_timeout_extra_s` (10 s). Both are under Advanced > Motor stage. A timeout now reports
+   the last position read, the move length, and the feed rate.
+2. Position readback compared software targets against GRBL's raw machine position (MPos), which
+   only works if MPos happened to be 0 at the software zero. Re-zeroing at the nudged origin during
+   calibration didn't reset MPos, so after any origin nudge every later check was off by the nudge
+   (and the saved calibration absorbed that error); connecting with the stage away from MPos 0 failed
+   immediately. `GrblXY` now records MPos at connect and at every `set_software_zero_here()`, and
+   `get_pos()` reports position relative to it, so readback is always in the commanded frame.
+
+Verified against a simulated GRBL stage (moves at the real feed rate on a virtual clock, reports
+interpolated MPos): the old code reproduces all three failures (no nudge: times out on far X; origin
+nudge: times out on far Y; stage not at MPos 0: times out on the origin). The fixed code completes
+all three and recovers a known stage scale/skew to about 2e-6, the limit of GRBL's 3-decimal
+moves. Full L and H scans (two voltage steps each, including the jump back to the first point)
+also run cleanly on the simulator.
+
 ## Stagger direction
 
 `ScanGeometryConfig.stagger_sign` (`+1.0` default, or `-1.0`) mirrors which side the
@@ -357,6 +381,13 @@ relationships (verified: pulling out L's points alone and checking nearest-neigh
 distances gives a perfectly uniform hex lattice, and H is always exactly 2x L's count),
 rather than an arbitrary skip pattern.
 
+**Serpentine order alternates per row of the scanned density (fixed in V1.4.7).** It used to
+alternate on the full-grid row number, but L and H rows interleave, so some consecutive H rows ran the
+same direction and the stage flew back across the whole board between them (about 1.5x the necessary
+travel for an H scan). It now alternates on `logical_row`, so every move in an L or H scan is at most
+one row step. `x_loop` (visit index within a row, used in per-point filenames) changes accordingly for
+H rows that used to run the other way.
+
 **`ScanPoint.logical_row` is each point's index *within its own density*** — 0 to
 `rows-1` for L, 0 to `2*rows-1` for H — matching pin-mapping row numbers directly (see
 "`build_pixel_mapping.py`" below), and deliberately *independent* of `l_subgrid`: which
@@ -379,58 +410,57 @@ In `uniform_board_mode=True` the scan runs in this order:
 3. Collect VNA at each stage point
 4. Move to next voltage and repeat
 
-## Large scans and memory
+## Data saving (V1.4.9)
 
-Two separate problems here, fixed together.
+Each scan writes into `output_directory/run_name/`, and refuses to start if that folder already
+holds scan data (pick a new run name rather than silently overwriting a previous run).
 
-**Redundant storage (the bigger one).** Every per-point file used to store `amplitudes`
-and `phases_deg` *alongside* the raw `sdata` they were computed from — but
-`amplitude = abs(sdata)` and `phase = degrees(angle(sdata))` are entirely derivable from
-`sdata`, so storing all three wrote roughly double what was needed, and the summary
-arrays duplicated that same derived data a second time on top of it. For a 32x32 grid,
-11 voltages, 5000 VNA points: the actual data of interest (`sdata` alone, complex128) is
-~0.9 GB, but the old code wrote **~2.7 GB** — about 4x. Fixed: `save_point()` and
-`open_summary_arrays()` now store `sdata` only, everywhere. Recomputing amplitude/phase
-on load is one line (`np.abs(sdata)`, `np.degrees(np.angle(sdata))`) and costs nothing
-worth avoiding. This alone gets the same scenario down to ~1.8 GB total — the remaining
-2x over the "essential" 0.9 GB is the per-point files and the summary array each holding
-a full copy of `sdata`, which is real but avoidable: if you only need one of the two
-forms, turning off `save_individual_npz` or `save_summary_npz` removes that copy entirely.
+**One file per visited coordinate**, named `<density>_R<row>_C<col>.npz` (row/col 0-indexed within
+that density, e.g. `L_R005_C012.npz`). This follows the legacy protocol: the first time a coordinate
+is visited, its file is created with every array already at its final size and empty (NaN); each
+later visit, at the next voltage, rewrites the file with everything saved so far plus the slot just
+measured. So at any moment, including after a crash or a cancelled scan, each file holds every
+voltage measured there so far, and `measured` says which slots are real. Writes go to a temporary
+file that is then renamed over the old one, so a failure mid-write can't corrupt a file that already
+holds earlier voltages.
 
-**RAM usage for the summary array.** `run_scan.py` used to preallocate the summary
-arrays entirely in RAM (`np.empty`) — fine for small scans, but for a full-board scan
-this can run into gigabytes, which can fail outright on a memory-constrained PC.
-`DataSaver.open_summary_arrays()` now creates this as a disk-backed memory-mapped array
-(`np.lib.format.open_memmap`, mode `"w+"`) instead, and the scan loop writes into it
-incrementally as each point is measured. **The real benefit isn't lower peak memory in
-an idle system** — if you write straight through the whole array with nothing else
-competing for RAM, actual resident memory ends up similar either way, since the OS still
-has to hold touched pages in RAM until they're written back. The benefit is what happens
-when memory *is* tight: an anonymous array that doesn't fit in RAM+swap raises
-`MemoryError` immediately (verified directly: an 8.2 GB anonymous array failed hard on a
-3.9 GB/no-swap test machine), while the memmapped version succeeded at the same size,
-because its backing store is the file on disk, not RAM+swap.
+| Key | Shape | Contents |
+| --- | --- | --- |
+| `e` | (V,) | voltage applied at each slot, NaN until measured (legacy key) |
+| `iteration` | () | index of the voltage slot written most recently (legacy key) |
+| `sdata` | (V, N) | raw complex S11, unrounded |
+| `measured`, `measured_time` | (V,) | which slots hold data, and when (Unix time) |
+| `voltages_v` | (V,) | the full planned voltage list |
+| `frequencies_hz` | (N,) | frequency axis from the VNA's read-back start/stop/points (linear sweep) |
+| `density`, `logical_row`, `logical_col` | () | which element this is |
+| `stage_x_mm`, `stage_y_mm` | () | ideal (planned) position |
+| `physical_x_mm`, `physical_y_mm` | () | position after the stage calibration correction |
+| `y_loop`, `x_loop` | () | full-grid row, and visit index within that row |
 
-**File layout as of both fixes:** each per-point `.npz` now has `sdata` (complex128) plus
-the small scalar fields (voltage, indices, coordinates) — no `amplitudes`/`phases_deg`
-keys anymore. The summary is `summary_sdata.npy` (one complex128 array, directly
-`np.load`-able) plus `summary_index.npz` (just `voltages_v` and `active_points`, which
-stay tiny regardless of scan size). This replaces the very first version's single
-`summary_arrays.npz` with `amplitudes`/`phases_deg`/`voltages_v`/`active_points` inside
-it — any existing analysis script needs updating to match, both for the file split and
-for computing amplitude/phase from `sdata` itself rather than reading them directly.
+V = number of voltages, N = VNA points. Magnitude and phase aren't stored (V1.4.10), since they
+come straight from `sdata`: `np.abs(sdata)` and `np.degrees(np.angle(sdata))`. At 4001 points
+that's about 64 kB per voltage per file, so 0.32 MB per coordinate for 5 voltages, and roughly
+330 MB for a 5-voltage L scan (1024 files) or 660 MB for H.
 
-`save_summary_npz=False` skips allocating *any* array (memmap or otherwise) — the
-original code always allocated the full in-RAM arrays regardless of the flag, only the
-final write was skipped.
+**`metadata.json`** is written once the hardware has connected, so it records what was actually
+used: the full config, the voltage list, the frequency axis (start/stop/points from the VNA's
+read-back), the stage calibration coefficients actually loaded (not just the file path, which could
+be overwritten by a later recalibration), the active-point list in visit order, and the start time.
 
-**On a cancelled scan:** `summary_sdata.npy` exists (created up front) but is only
-partially populated — the rest is whatever `open_memmap`'s initial fill left there.
-`summary_index.npz` is *not* written on cancellation, since there's no reliable way to
-tell which rows are real data from the array alone — the per-point `.npz` files remain
-the source of truth for a cancelled run.
+**Optional whole-run summary** (`save.save_summary_npz`, now off by default): `summary_sdata.npy`,
+one disk-backed complex array of shape (points, voltages, N) in active-point order, plus
+`summary_index.npz` (`voltages_v`, `active_points`, `frequencies_hz`) when the scan completes. It
+duplicates the per-coordinate files, doubling disk use, so turn it on only if an analysis wants
+everything in one array.
 
+The V1.4.3-V1.4.8 layout (one file per measurement, `V###_C###_R###_Y###_X###.npz`, with `sdata`
+only) is gone; per-coordinate files replace it.
 
+Verified with dry-run scans fed recognisable fake traces: one file per coordinate, every slot holds
+exactly its own (point, voltage) trace, calibrated coordinates and
+the frequency axis are correct, a cancelled scan leaves earlier voltages intact with the rest NaN,
+a reused run name is refused, and a simulated disk error mid-write leaves the existing file loadable
+with its earlier data.
 
 ## Notes
 

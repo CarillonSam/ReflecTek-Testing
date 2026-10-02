@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -82,7 +83,11 @@ class MotorStage(ABC):
     def goto_xy(self, x_mm: float, y_mm: float) -> None: ...
 
     @abstractmethod
-    def wait_until_reached(self, target_x_mm: float, target_y_mm: float, timeout_s: float = 30.0) -> StagePosition: ...
+    def wait_until_reached(
+        self, target_x_mm: float, target_y_mm: float, timeout_s: float | None = None
+    ) -> StagePosition:
+        """timeout_s=None lets the implementation size the timeout to the move."""
+        ...
 
     @abstractmethod
     def home_xy(self) -> None: ...
@@ -94,13 +99,21 @@ class MotorStage(ABC):
         self.goto_xy(*self.calibration.transform(ideal_x_mm, ideal_y_mm))
 
     def wait_until_reached_ideal(
-        self, ideal_x_mm: float, ideal_y_mm: float, timeout_s: float = 30.0
+        self, ideal_x_mm: float, ideal_y_mm: float, timeout_s: float | None = None
     ) -> StagePosition:
         return self.wait_until_reached(*self.calibration.transform(ideal_x_mm, ideal_y_mm), timeout_s)
 
 
 class GrblXY(MotorStage):
-    """GRBL XY stage with software-defined coordinates and relative moves (G91)."""
+    """
+    GRBL XY stage with software-defined coordinates and relative moves (G91).
+
+    Coordinates: x_mm/y_mm are software coordinates, zero wherever the stage was at
+    connect (or at the last set_software_zero_here). GRBL's status report gives machine
+    position (MPos), which has its own zero, so get_pos() subtracts the MPos recorded at
+    each software zero. That keeps readback in the same frame as the commanded targets
+    no matter where the machine origin is, or how many times software zero is re-set.
+    """
 
     def __init__(self, config: StageConfig) -> None:
         self.config = config
@@ -114,8 +127,11 @@ class GrblXY(MotorStage):
 
             self.x_mm = 0.0
             self.y_mm = 0.0
+            self._last_move_mm = 0.0
             for cmd in ("$X", "G21", "G91", f"F{config.feed_mm_per_min:.3f}"):
                 self._send(cmd)
+            # Software zero = wherever the stage is right now, whatever its MPos.
+            self._mpos_offset = self._read_mpos()
         except Exception:
             # Startup handshake failed after the port opened — close it explicitly rather
             # than leaving it open on a discarded, partially-constructed object.
@@ -142,6 +158,8 @@ class GrblXY(MotorStage):
     def goto_xy(self, x_mm: float, y_mm: float) -> None:
         tx, ty = float(x_mm), float(y_mm)
         self._send(f"G1 X{tx - self.x_mm:.3f} Y{ty - self.y_mm:.3f}")
+        # G1's feed is the vector speed, so travel time scales with straight-line distance.
+        self._last_move_mm = math.hypot(tx - self.x_mm, ty - self.y_mm)
         self.x_mm, self.y_mm = tx, ty
         if self.config.settle_s > 0:
             time.sleep(self.config.settle_s)
@@ -158,9 +176,27 @@ class GrblXY(MotorStage):
         self.goto_xy(0.0, 0.0)
 
     def set_software_zero_here(self) -> None:
+        """Makes the stage's current physical position (0, 0), for both commanded moves and
+        get_pos() readback. Call only once the stage has stopped (e.g. after
+        wait_until_reached), since it records the current MPos as the new zero."""
+        self._mpos_offset = self._read_mpos()
         self.x_mm = self.y_mm = 0.0
 
+    def move_timeout_s(self, distance_mm: float | None = None) -> float:
+        """Time allowed for a move of distance_mm (default: the last commanded move)."""
+        if distance_mm is None:
+            distance_mm = self._last_move_mm
+        travel_s = distance_mm / (self.config.feed_mm_per_min / 60.0)
+        return travel_s * self.config.move_timeout_factor + self.config.move_timeout_extra_s
+
     def get_pos(self) -> StagePosition:
+        """Current position in software coordinates (same frame as goto_xy targets)."""
+        mx, my = self._read_mpos()
+        ox, oy = self._mpos_offset
+        return StagePosition(mx - ox, my - oy)
+
+    def _read_mpos(self) -> tuple[float, float]:
+        """Raw machine position (MPos) from a GRBL status report."""
         self.ser.reset_input_buffer()
         self.ser.write(b"?")
         deadline = time.time() + 1.0
@@ -168,20 +204,39 @@ class GrblXY(MotorStage):
             line = self.ser.readline().decode("utf-8", errors="ignore").strip()
             if "MPos:" in line:
                 x, y = line.split("MPos:")[1].split("|")[0].split(",")[:2]
-                return StagePosition(float(x), float(y))
-        raise TimeoutError("Timed out waiting for GRBL position response.")
+                return float(x), float(y)
+        raise TimeoutError(
+            "Timed out waiting for a GRBL status report with MPos. If GRBL's $10 setting "
+            "reports WPos instead, set $10=1 (MPos) on the controller."
+        )
 
     def wait_until_reached(
-        self, target_x_mm: float, target_y_mm: float, timeout_s: float = 30.0
+        self, target_x_mm: float, target_y_mm: float, timeout_s: float | None = None
     ) -> StagePosition:
+        """
+        Polls until within position_tolerance_mm of the target. timeout_s=None (default)
+        sizes the timeout to the last commanded move (see move_timeout_s), so long moves
+        aren't cut off mid-travel. The old fixed 30 s timed out on any move longer than
+        250 mm at the default 500 mm/min feed.
+        """
+        if timeout_s is None:
+            timeout_s = self.move_timeout_s()
         tol, poll = self.config.position_tolerance_mm, self.config.readback_poll_s
-        deadline = time.time() + timeout_s
+        start = time.time()
+        deadline = start + timeout_s
+        pos = None
         while time.time() < deadline:
             pos = self.get_pos()
             if abs(target_x_mm - pos.x_mm) <= tol and abs(target_y_mm - pos.y_mm) <= tol:
                 return pos
             time.sleep(poll)
-        raise TimeoutError(f"Stage did not reach target ({target_x_mm:.3f}, {target_y_mm:.3f}) mm.")
+        where = f"last read ({pos.x_mm:.3f}, {pos.y_mm:.3f}) mm" if pos else "no position read"
+        raise TimeoutError(
+            f"Stage did not reach target ({target_x_mm:.3f}, {target_y_mm:.3f}) mm within "
+            f"{timeout_s:.1f} s ({where}; last move {self._last_move_mm:.1f} mm at "
+            f"{self.config.feed_mm_per_min:g} mm/min). If it was still moving, raise "
+            f"stage.move_timeout_extra_s or stage.move_timeout_factor."
+        )
 
 
 # ============================================================ scan geometry ====
@@ -264,11 +319,15 @@ class HexGridPlanner:
             is_offset_row = (dense_row % 2 == 1) if c.offset_odd_rows else (dense_row % 2 == 0)
             row_offset_mm = c.stagger_sign * sub_spacing_mm / 2 if is_offset_row else 0.0
 
-            col_order = range(c.cols)
-            if c.serpentine and dense_row % 2 == 1:
-                col_order = reversed(col_order)
-
             logical_row = l_row if density == "L" else h_row
+
+            # Serpentine alternates per row *of the scanned density*, not per full-grid
+            # row: L and H rows interleave, so alternating on dense_row made consecutive H
+            # rows (e.g. dense rows 2 and 4) run the same direction, flying the stage back
+            # across the whole board between them.
+            col_order = range(c.cols)
+            if c.serpentine and logical_row % 2 == 1:
+                col_order = reversed(col_order)
             for visit_index, col in enumerate(col_order):
                 yield ScanPoint(
                     y_loop=dense_row,

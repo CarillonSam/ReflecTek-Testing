@@ -5,7 +5,7 @@ Elements are named the way the pinout names them, 1-indexed: L elements are E<ro
 (E1_1 .. E32_32) and H elements are H<row>_<col> (H1_1 .. H64_32). "L<row>_<col>" is
 accepted for L too, and an underscore after the letter is optional (H_1_1 = H1_1).
 Internally rows/columns are 0-indexed, so H1_1 is (H, row 0, col 0) — the same numbering
-as the mapping CSVs, the scan points, and the data file names.
+as the pinout (pinout.py), the scan points, and the data file names.
 
 Three CSV layouts are accepted:
   - Labelled: each row holds an element name and a voltage, e.g. "H1_1, 2.5". May mix E

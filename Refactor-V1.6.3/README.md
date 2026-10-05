@@ -1,9 +1,10 @@
 # Array Scan Project
 
-**Version 1.6.1.** Pattern-run analysis now time-gates the data (fix to 1.6.0, which showed ungated phase).
-1.6.0 added voltage pattern scans (a new feature, so a minor-version step from 1.5.0).
-Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old presets, data files or calibrations
-no longer valid) bump MAJOR, new features bump MINOR, and bug fixes bump PATCH.
+**Version 1.6.3.** The pixel controller reads each element's address straight from the pinout
+spreadsheet; the separate mapping CSVs, their settings, and the scripts that generated them are gone.
+1.6.2 shipped generated mapping files; 1.6.1 made pattern-run analysis time-gated; 1.6.0 added
+voltage pattern scans. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old presets, data
+files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug fixes bump PATCH.
 
 ## Files
 
@@ -11,8 +12,7 @@ no longer valid) bump MAJOR, new features bump MINOR, and bug fixes bump PATCH.
 - `stage.py` — motor stage handler (`MotorStage` interface + `GrblXY` implementation),
   the scan geometry it moves through (`HexGridPlanner`), and stage calibration (`StageCalibration`)
 - `calibrate_stage.py` — one-time interactive calibration utility (run standalone, not part of a scan)
-- `controller.py` — `BoardController` interface, plus the legacy CSV mapping helpers
-  shared by any controller implementation
+- `controller.py` — `BoardController` interface, plus small helpers shared by controllers
 - `pixel_controller.py` — `PixelController`: the framed-serial-protocol board controller
 - `pi_controller.py` — `PiBoardController`: SSH/file-upload board controller for the
   Raspberry Pi + SPI DAC setup (wraps `PiController`, the paramiko transport layer)
@@ -21,9 +21,10 @@ no longer valid) bump MAJOR, new features bump MINOR, and bug fixes bump PATCH.
 - `data.py` — data handler: `DataSaver`
 - `run_scan.py` — coordinator (`AutomatedArrayScanner`) that wires the four handlers
   together and runs the scan; also has the example run config in `__main__`
-- `merge_mapping_workspace.py` — one-off utility to build a mapping CSV workspace (see below)
-- `build_pixel_mapping.py` — generates the real `PixelController` mapping CSV directly
-  from the pinout spreadsheet (needs `openpyxl`, not a dependency of anything else here)
+- `pinout.py` — reads each element's controller index straight from `pinout_32x32.xlsx` (needs
+  `openpyxl`), checked against `Pixel_Map_by_ConnRow.csv`; see "Element addressing" below
+- `pinout_32x32.xlsx` — the board pinout: element names, pins and MUX words
+- `Pixel_Map_by_ConnRow.csv` — the controller's wiring table (index, connector, pin, MUX word, DAC select)
 - `config_io.py` — RunConfig <-> JSON (for saving/loading GUI presets)
 - `branding.py` — app name ("Candice") and the kiss-mark logo loader
 - `kiss_mark.png` — the logo image (40x35, transparent background)
@@ -119,8 +120,7 @@ What the GUI covers end to end:
   mirror stagger direction
 - File paths (moved here in V1.4.6): output directory and run name (`save.output_dir`,
   `save.run_name`; data lands in output directory / run name), stage calibration file
-  (`stage.calibration_file`), and the L/H mapping CSVs (`pixels.mapping_csv_l` / `_h`, shown only
-  when the pixel controller is selected). The Pi controller's `pi.local_file_*`/`remote_file_*`
+  (`stage.calibration_file`). The Pi controller's `pi.local_file_*`/`remote_file_*`
   paths stay under Advanced, since they're fixed wiring for the Pi setup rather than per-run files.
 
 *Advanced settings* (collapsed by default; **Show advanced settings**) holds every other field in
@@ -248,8 +248,8 @@ the controller's range, a duplicate or unknown name). Validate and Start refuse 
 before any hardware moves.
 
 **Hardware:** with the pixel controller, every output is first set to 0 V, then each element in the
-pattern is set through its density's mapping CSV, so the L and/or H mapping CSV must be set for
-whichever densities the pattern names. Elements of the other density not in the file stay at 0 V.
+pattern is set by its index from the pinout (see "Element addressing" below), so nothing needs
+selecting. Elements of the other density not in the file stay at 0 V.
 The Pi controller takes one grid for the scanned density only, so a pattern that sets the other
 density's elements to anything but 0 V is refused. After programming, the scan waits the settle time.
 
@@ -268,11 +268,38 @@ shows its gated phase and magnitude vs frequency with the heatmap frequency mark
 reference option is greyed out.
 
 Verified: pattern files built from the real pinout labels load in all three layouts, and bad files
-are rejected with the reasons above; with the pinout's L and H mapping CSVs, all 3072 controller
+are rejected with the reasons above; addressed from the pinout, all 3072 controller
 outputs end at exactly their element's voltage; a pattern scan run from the GUI completes and saves
 the files above; and on a synthetic pattern run with a known phase for every element plus a late reflection,
 the gated-phase heatmap recovers each element's direct-path phase (the reflection gated out) and
 the applied-voltage heatmap matches the pattern exactly.
+
+## Element addressing: straight from the pinout (V1.6.3)
+
+The pixel controller's protocol sets an element by index (`CMD_SET_BY_INDEX`); the firmware turns
+the index into the MUX/DAC address. `pinout.py` reads every element's index straight from
+`pinout_32x32.xlsx` (sheet "PINOUT CONTROLLER"): an element's index is its position when the sheet
+is read block by block (8 column blocks, 5 row bands each, odd- and even-pin columns top to bottom,
+GND pins skipped). There is no separate mapping file and nothing to select: the pinout is the only
+source. A different board's pinout can be used by setting `pixels.pinout_file` under Advanced.
+
+Every time the pinout is loaded (once per connection, about half a second) it is checked against
+`Pixel_Map_by_ConnRow.csv`, the controller's wiring table: the MUX word at each index must match.
+A MUX word alone isn't unique (each is shared by six elements on different DAC selects); the index
+is. A mismatch stops the scan before anything is sent, which catches a different board's
+spreadsheet, a missing or extra pin, rows out of order, or an edited MUX word (all tested on
+altered copies). It can't catch two element names swapped while their pins stay put, since the
+wiring table has no element names to compare against; the pinout's names are trusted as written.
+
+`python pinout.py` prints a summary; `python pinout.py --export table.csv` writes one row per
+element (name, index, MUX word, connector, pin) for reference. That the firmware's index order
+matches the wiring table is still worth one bench check: set a single element and confirm it's the
+expected one.
+
+1.6.2 shipped `pixel_mapping_L.csv`/`pixel_mapping_H.csv` generated from the pinout; earlier versions
+required selecting those files by hand. Both are gone, along with `build_pixel_mapping.py`,
+`merge_mapping_workspace.py` and `mapping_template_32x32.csv`. Presets that still name mapping files
+load fine; those entries are ignored.
 
 ## Analysis tab
 
@@ -328,7 +355,7 @@ These moves bypass calibration deliberately — `goto_x`/`goto_y` are the raw st
 primitives, not `goto_ideal_xy`, since manual hardware debugging wants direct physical
 control, not the ideal-to-physical correction a scan applies. The voltage field calls
 `set_voltage_grid(np.array([[v]]))` — a 1x1 array still trips the uniform-grid fast path
-the pixel controller has (see "DAC mapping" — any single-value grid
+the pixel controller has (see "How a board element becomes a controller address" — any single-value grid
 takes the broadcast-to-everything path, regardless of its logical shape), so it correctly
 sets every physical output with no need to reconstruct the real scan geometry here.
 
@@ -481,17 +508,14 @@ one row step. `x_loop` (visit index within a row, used in per-point filenames) c
 H rows that used to run the other way.
 
 **`ScanPoint.logical_row` is each point's index *within its own density*** — 0 to
-`rows-1` for L, 0 to `2*rows-1` for H — matching pin-mapping row numbers directly (see
-"`build_pixel_mapping.py`" below), and deliberately *independent* of `l_subgrid`: which
+`rows-1` for L, 0 to `2*rows-1` for H — matching the pinout's own row numbers (E5_9 is L row 4;
+see "Element addressing" below), and deliberately *independent* of `l_subgrid`: which
 physical pin drives "the 5th L element" doesn't change just because that element's
 physical position moved to a different lattice phase. (`l_subgrid` only affects the
 internal `dense_row` used to compute `stage_x_mm`/`stage_y_mm` — it never reaches
 `logical_row`.) L and H `logical_row` ranges legitimately overlap (both start at 0),
-which is why the Scan tab's point lookup and the mapping CSVs are both keyed with
+which is why the Scan tab's point lookup and the pinout lookup are both keyed with
 density alongside row/col, not row/col alone.
-**`mapping_template_32x32.csv` is stale** — it predates the density split entirely and
-isn't in the right shape for either one. `build_pixel_mapping.py` replaces the workflow
-it was for, so no need to regenerate it as a template.
 
 ## Current scan order
 
@@ -585,9 +609,9 @@ it can only shift which H rows at the edges get scanned, and which H row is numb
   issue). This also replaces the old fixed `time.sleep(1)` between each command with the
   query itself as the sync point, which is instrument-paced rather than guessed.
 
-- If you're using `PixelController`, set `uniform_board_mode=False` and provide
-  `RunConfig.pixels.mapping_csv_l` / `mapping_csv_h` (see `build_pixel_mapping.py`).
-  `PiBoardController` needs no mapping at all — see "Using the Pi controller" above.
+- Per-element (mapped) sweeps: set `uniform_board_mode=False`. `PixelController` addresses each
+  element from the pinout automatically; `PiBoardController` needs no addressing on the PC side —
+  see "Using the Pi controller" above.
 - `RunConfig.uniform_board_settle_s` (default 45 s, "Settle time" in General) adds a delay between updating all pixels and
   starting the X-Y-VNA sweep; `single_pixel_settle_s` is for mapped-element mode
 - `RunConfig.uniform_board_settle_per_point` (uniform board mode only):
@@ -607,119 +631,11 @@ Then run:
 python run_scan.py
 ```
 
-## DAC mapping — how a board element becomes a controller address
+## How a board element becomes a controller address
 
-This is now **controller-specific**, not a shared concept — the two controllers address
-hardware too differently for one explanation to cover both.
+**`PixelController`:** a uniform grid (every value equal) takes a broadcast path that sets every
+output, with no addressing needed. A non-uniform grid or a voltage pattern sets each element by its
+index from the pinout (see "Element addressing" above).
 
-**`PixelController`** still needs a mapping CSV — now two of them,
-`PixelControllerConfig.mapping_csv_l` and `mapping_csv_h`, since L and H elements are
-wired to completely different pins (see "`build_pixel_mapping.py`" below for why one
-shared file doesn't work). `PixelController.__init__` takes a `density_mode` argument
-and loads whichever file matches — `run_scan.py` passes
-`RunConfig.geometry.density_mode` automatically. `ElementToControllerMap` (in
-`controller.py`) reads whichever file got loaded and gives you, per
-`(element_row, element_col)`, a `controller_index` — the native serial-protocol address.
-`set_voltage_grid` looks this up per grid cell and batches serial `set pixel` commands.
-No mapping CSV is needed for a **uniform** grid (every value equal) — it detects that
-case and takes a fast broadcast path instead; mapping only matters once a grid varies
-element-to-element (mapped-element mode).
-
-**`PiBoardController` needs no mapping at all.** The Pi has its own internal
-element-to-DAC map, so the array `set_voltage_grid` receives gets uploaded directly —
-`csv[row][col]` is the voltage for the element at that position, and the Pi's own
-firmware handles the rest. See "Using the Pi controller" above for the details
-(`active_band`, `hb_shape`/`lb_shape`).
-
-**Still open, and this is real hardware truth I don't have:**
-1. Is the `PixelController` board the same physical array of elements the Pi drives, or
-   a different array entirely? Doesn't block either controller working independently,
-   but matters if you're trying to reconcile results between them.
-2. `PixelController`'s `controller_index == global_index` (from `Pixel_Map_by_ConnRow.csv`)
-   is still an unverified assumption — worth a real bench check (single low-voltage
-   element, confirm it's physically the element you expected) before trusting
-   mapped-element mode.
-3. `PiControllerConfig.hb_shape`/`lb_shape` are placeholder `(24, 8)` — need real numbers.
-
-## Legacy mapping CSV
-
-`Pixel_Map_by_ConnRow.csv` is included for reference. It's useful for global_index lookup,
-connector/pin lookup, and row-based grouping used by the original GUI. It does **not** by
-itself define the final 32x32 stage-element-to-controller map — for that you still need the
-element `(row, col)` mapping you are building.
-
-## `build_pixel_mapping.py` — generating the real mapping CSVs
-
-Builds `PixelController`'s mapping CSVs directly from the pinout spreadsheet's "PINOUT
-CONTROLLER" sheet — no manual cross-referencing, which is what
-`merge_mapping_workspace.py` (below) existed for before element identity was available.
-
-```
-python build_pixel_mapping.py pinout_32x32.xlsx --output pixel_mapping
-  -> writes pixel_mapping_L.csv (1024 rows) and pixel_mapping_H.csv (2048 rows)
-```
-
-**Which controller pin drives which element is a fixed wiring fact, independent of
-`l_subgrid`.** `l_subgrid` is purely a stage-motion parameter (which of the 3 lattice
-phases *this DUT's* low-density elements are physically mounted at — different DUTs can
-differ here) and has nothing to do with addressing. So `element_row` here is just each
-label's own row number directly — `E12_4` → row 11, `H37_9` → row 36 — no phase
-decoding at all. L and H elements are wired to entirely different pins and their row
-numbers overlap (both start at 0), which is why this writes two separate files rather
-than one: load `pixel_mapping_L.csv` as `PixelControllerConfig.mapping_csv_l` and
-`pixel_mapping_H.csv` as `mapping_csv_h`; `PixelController` picks whichever one matches
-the active `density_mode` automatically.
-
-(This replaced an earlier, wrong version of this script that *did* fold `l_subgrid` into
-the decode — that conflated "where the stage physically goes" with "which pin gets
-written," which aren't the same thing. Fixed once that was pointed out.)
-
-**What's actually verified, not assumed:** the script's row/column traversal order (8
-connector-blocks arranged 5 row-bands deep, each block holding 2 interleaved pin
-sub-columns for odd/even pins) was cross-checked directly against
-`Pixel_Map_by_ConnRow.csv` — the resulting pin/mux-word sequence matches that file
-exactly, 0 mismatches across all 3072 entries. That confirms `controller_index`
-(assigned as each element's position in this traversal, 0 to 3071) correctly lines up
-with the right `H{row}_{col}`/`E{row}_{col}` label for every single element — this
-isn't sampled or spot-checked, it's a complete match. Also directly confirmed through the
-real scanner: for the same logical element, `controller_index` is identical across all 3
-`l_subgrid` values (only the physical stage position and scan visit order differ) —
-exactly the independence this design depends on.
-
-**What's still an assumption:** `controller_index == global_index` itself (the same
-"gut feeling" flagged earlier) — a real bench check (single low-voltage element,
-confirm it's physically the one you expected) is still worth doing before trusting
-mapped-element mode.
-
-Needs `openpyxl` (`pip install openpyxl`) — not a dependency of the GUI or scan pipeline
-itself, only this one script.
-
-## What `merge_mapping_workspace.py` does
-
-**Superseded by `build_pixel_mapping.py`** now that the pinout spreadsheet has element
-identity in it — this section is kept for reference, not as the recommended path.
-
-You need a CSV that maps each physical board element `(element_row, element_col)` to the
-`controller_index` the pixel controller uses to address it — that's what
-`mapping_csv_l`/`mapping_csv_h` on `PixelControllerConfig` point to, and what
-`ElementToControllerMap` reads. Before the pinout spreadsheet was available,
-`merge_mapping_workspace.py` was how you'd get started building that file by hand:
-
-1. Reads `mapping_template_32x32.csv` — a blank 1024-row grid, one row per `(element_row,
-   element_col)`, with empty `controller_index`/`band`/`band_channel` columns waiting to be filled in.
-2. Reads `Pixel_Map_by_ConnRow.csv` — the legacy 3072-row wiring table, which tells you,
-   for each `global_index`, which physical connector/pin/DAC channel it's wired to.
-3. Writes `mapping_workspace.csv`: the blank grid with extra empty columns
-   (`legacy_row`, `legacy_connector`, `legacy_pin`, `legacy_dac_sel_int`, `legacy_dac_ch`,
-   `assignment_notes`) for you to fill in by hand as you work out which connector goes
-   with which board element.
-4. Also writes `legacy_connrow_reference.csv` — just the useful columns of the legacy
-   table, trimmed down for easier side-by-side lookup while you do that.
-
-It doesn't compute or infer any mapping itself — it's a one-time helper that saves you
-from manually re-typing 1024 rows of template and gives you a reference sheet next to it.
-Once you've filled in `controller_index` for each element and saved that as your real
-mapping CSV, point `PixelControllerConfig.mapping_csv_l` (or `_h`) at it and set
-`uniform_board_mode=False`. Again — if you have a pinout spreadsheet with element
-identity in it like this project does, `build_pixel_mapping.py` does this step for you
-directly; this manual workflow is the fallback for when you don't.
+**`PiBoardController`** needs no PC-side addressing: the Pi has its own internal element-to-DAC
+map. See "Using the Pi controller" above.

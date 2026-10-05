@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import struct
 import threading
 import time
@@ -11,7 +13,8 @@ import numpy as np
 import serial
 
 from config import PixelControllerConfig
-from controller import BoardController, ElementToControllerMap, clip_voltage, uniform_value
+from controller import BoardController, clip_voltage, uniform_value
+from pinout import Pinout, load_pinout
 
 SOF = bytes([0x55, 0xAA])
 PROTO_VER = 0x01
@@ -129,47 +132,30 @@ class PixelController(BoardController):
 
     def __init__(self, config: PixelControllerConfig, density_mode: str = "L") -> None:
         """
-        density_mode ("L" or "H") picks which of mapping_csv_l/mapping_csv_h gets
-        loaded — L and H elements are wired to entirely different pins, so the right
-        file depends on which density this scan is actually addressing. Callers that
-        never send a non-uniform grid (e.g. manual debug actions) can leave this at the
-        default; it's only consulted if set_voltage_grid ever needs to look up a
-        specific element.
+        density_mode ("L" or "H") is the density a non-uniform grid refers to: a grid's
+        (col, row) cell is that density's element. Elements are addressed by their index
+        in the pinout spreadsheet (pinout.py); no separate mapping file is involved. The
+        pinout is only read the first time it's needed (a non-uniform grid or a pattern).
         """
         self.config = config
+        self.density_mode = density_mode
         self.comm = DeviceComm(config.port, baud=config.baud, timeout=config.timeout_s)
-        mapping_csv = config.mapping_csv_l if density_mode == "L" else config.mapping_csv_h
-        try:
-            self.pixel_map: Optional[ElementToControllerMap] = (
-                ElementToControllerMap.from_csv(mapping_csv) if mapping_csv else None
-            )
-        except Exception:
-            self.comm.close()
-            raise
         self._last_grid: Optional[np.ndarray] = None
-        self._density_maps: dict[str, ElementToControllerMap] = {}
+        self._pinout: Optional[Pinout] = None
 
-    def _map_for(self, density: str) -> ElementToControllerMap:
-        """The L or H element map, loaded the first time it's needed."""
-        if density not in self._density_maps:
-            path = self.config.mapping_csv_l if density == "L" else self.config.mapping_csv_h
-            if not path:
-                field_name = "mapping_csv_l" if density == "L" else "mapping_csv_h"
-                raise RuntimeError(
-                    f"The voltage pattern sets {density} elements, which needs the {density} mapping CSV "
-                    f"(pixels.{field_name}, 'L/H mapping CSV' in General settings)."
-                )
-            self._density_maps[density] = ElementToControllerMap.from_csv(path)
-        return self._density_maps[density]
+    @property
+    def pinout(self) -> Pinout:
+        if self._pinout is None:
+            self._pinout = load_pinout(self.config.pinout_file)
+        return self._pinout
 
     def apply_pattern(self, voltages: dict, default_v: float = 0.0) -> None:
         """
         Sets the whole board: every output to default_v first (one broadcast), then each
         element in `voltages` ({(density, row, col): volts}, 0-indexed) to its own value,
-        addressed through that density's mapping CSV. Elements of the other density that
-        aren't in `voltages` stay at default_v.
+        addressed by its pinout index. Elements not in `voltages` stay at default_v.
         """
-        assignments = [(self._map_for(d).get_index(r, c), float(v)) for (d, r, c), v in voltages.items()]
+        assignments = [(self.pinout.index(d, r, c), float(v)) for (d, r, c), v in voltages.items()]
         self._set_all_pixels(default_v)
         self._set_pixels(assignments)
         if self.config.save_to_flash_after_set:
@@ -192,11 +178,8 @@ class PixelController(BoardController):
             self._last_grid = np.full_like(voltages, v0)
             return
 
-        if self.pixel_map is None:
-            raise RuntimeError("Non-uniform voltage grid requires PixelControllerConfig.mapping_csv_l/mapping_csv_h.")
-
         assignments = [
-            (self.pixel_map.get_index(row, col), float(voltages[col, row]))
+            (self.pinout.index(self.density_mode, row, col), float(voltages[col, row]))
             for col, row in self._changed_cells(voltages)
         ]
         self._set_pixels(assignments)

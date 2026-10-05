@@ -120,8 +120,8 @@ class AutomatedArrayScanner:
         return np.full(self.grid_shape, voltage_v, dtype=float)
 
     def _single_point_grid(self, point: ScanPoint, voltage_v: float) -> np.ndarray:
-        """Every element at 0 V except this point's — the controller's mapping decides
-        where (logical_col, logical_row) physically lands."""
+        """Every element at 0 V except this point's. The controller addresses that element
+        by its index in the pinout (pinout.py)."""
         grid = np.zeros(self.grid_shape, dtype=float)
         grid[point.logical_col, point.logical_row] = voltage_v
         return grid

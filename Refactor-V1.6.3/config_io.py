@@ -14,7 +14,7 @@ from config import (
 # Fields that are Path (or Path | None) and need str(...)/Path(...) conversion for JSON.
 _PATH_FIELDS = {
     StageConfig: {"calibration_file"},
-    PixelControllerConfig: {"mapping_csv_l", "mapping_csv_h"},
+    PixelControllerConfig: {"pinout_file"},
     SaveConfig: {"output_dir"},
 }
 # Fields that are tuples in the dataclass; JSON round-trips them as lists.

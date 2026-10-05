@@ -35,7 +35,6 @@ SCAN_TYPE_LABELS = {"sweep": "Voltage sweep", "pattern": "Voltage pattern (CSV)"
 SCAN_TYPE_FROM_LABEL = {v: k for k, v in SCAN_TYPE_LABELS.items()}
 GENERAL_GEOMETRY_FIELDS = {"rows", "cols", "spacing_mm", "density_mode", "l_subgrid", "stagger_sign"}
 GENERAL_STAGE_FIELDS = {"calibration_file"}
-GENERAL_PIXEL_FIELDS = {"mapping_csv_l", "mapping_csv_h"}
 GENERAL_SAVE_FIELDS = {"output_dir", "run_name"}
 SUBCONFIG_FIELDS = {"stage", "pixels", "pi", "vna", "geometry", "save"}
 
@@ -43,7 +42,7 @@ SUBCONFIG_FIELDS = {"stage", "pixels", "pi", "vna", "geometry", "save"}
 ADVANCED_GROUPS = [
     ("Run", "", RunConfig, SUBCONFIG_FIELDS | GENERAL_RUN_FIELDS),
     ("Motor stage", "stage", StageConfig, GENERAL_STAGE_FIELDS),
-    ("Pixel controller", "pixels", PixelControllerConfig, GENERAL_PIXEL_FIELDS),
+    ("Pixel controller", "pixels", PixelControllerConfig, set()),
     ("Pi controller", "pi", PiControllerConfig, {"active_band"}),
     ("VNA", "vna", VNAConfig, set()),
     ("Scan geometry", "geometry", ScanGeometryConfig, GENERAL_GEOMETRY_FIELDS),
@@ -67,8 +66,9 @@ GENERAL_LABELS = {
     "geometry.rows": "Rows", "geometry.cols": "Columns", "geometry.spacing_mm": "Full-grid spacing",
     "save.output_dir": "Output directory", "save.run_name": "Run name",
     "stage.calibration_file": "Stage calibration file",
-    "pixels.mapping_csv_l": "L mapping CSV", "pixels.mapping_csv_h": "H mapping CSV",
 }
+# Hints for specific Advanced fields, where the generic type hint isn't enough.
+FIELD_HINTS = {"pixels.pinout_file": "blank = pinout_32x32.xlsx in the app folder"}
 # Advanced geometry fields that change the plotted points (serpentine only changes visit order).
 PREVIEW_FIELDS = {"geometry.row_spacing_mm", "geometry.offset_odd_rows",
                   "geometry.x_direction_sign", "geometry.y_direction_sign"}
@@ -262,12 +262,6 @@ class SettingsTab(ttk.Frame):
         self._add_field(frame, r, "Run name", "save.run_name", "str", hint="subfolder for this run"); r += 1
         self._add_field(frame, r, "Stage calibration file", "stage.calibration_file", "path_opt",
                         hint="blank = uncalibrated"); r += 1
-        # Only the pixel controller uses PC-side mapping files; hidden when "pi" is selected.
-        self._pixel_mapping_rows = [
-            self._add_field(frame, r, "L mapping CSV", "pixels.mapping_csv_l", "path_opt", hint="pixel controller only"),
-            self._add_field(frame, r + 1, "H mapping CSV", "pixels.mapping_csv_h", "path_opt", hint="pixel controller only"),
-        ]
-        r += 2
 
     def _on_scan_type_changed(self) -> None:
         pattern = SCAN_TYPE_FROM_LABEL[self.scan_type_var.get()] == "pattern"
@@ -340,7 +334,8 @@ class SettingsTab(ttk.Frame):
                     on_change = self._notify_geometry_change
                 elif key.startswith("vna."):
                     on_change = self._update_vna_summary
-                self._add_field(group, r, key, key, kind, hint=KIND_HINTS[kind], on_change=on_change)
+                self._add_field(group, r, key, key, kind, hint=FIELD_HINTS.get(key, KIND_HINTS[kind]),
+                                on_change=on_change)
                 r += 1
 
     def _toggle_advanced(self) -> None:
@@ -353,12 +348,8 @@ class SettingsTab(ttk.Frame):
         self._advanced_visible = not self._advanced_visible
 
     def _on_controller_type_changed(self) -> None:
-        """Only the selected controller's settings are shown (General mapping CSVs and the
-        Advanced controller group)."""
+        """Only the selected controller's settings group is shown under Advanced."""
         use_pi = self.controller_type_var.get() == "pi"
-        for row_widgets in self._pixel_mapping_rows:
-            for w in row_widgets:
-                w.grid_remove() if use_pi else w.grid()
         shown, hidden = ("pi", "pixels") if use_pi else ("pixels", "pi")
         self._group_frames[hidden].pack_forget()
         self._group_frames[shown].pack(fill="x", pady=4, after=self._group_frames["stage"])

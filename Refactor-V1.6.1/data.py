@@ -79,12 +79,15 @@ class DataSaver:
         sdata: np.ndarray,
         frequencies_hz: np.ndarray,
         physical_xy: tuple[float, float],
+        extra: dict | None = None,
     ) -> Path | None:
         """Fills slot voltage_index of this coordinate's file and rewrites the file."""
         if not self.config.save_individual_npz:
             return None
         path = self.run_dir / point_filename(point)
         arrays = self._load_or_create(path, point, voltages_v, frequencies_hz, physical_xy)
+        for key, value in (extra or {}).items():
+            arrays.setdefault(key, value)
 
         arrays["e"][voltage_index] = voltages_v[voltage_index]
         arrays["sdata"][voltage_index] = sdata

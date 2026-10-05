@@ -1,9 +1,9 @@
 # Array Scan Project
 
-**Version 1.5.0.** Same code as the 1.4.16 build, renumbered: the settings reorganisation and the
-Analysis tab are new features, so this is a minor-version step. Version numbers follow MAJOR.MINOR.PATCH
-from here on: breaking changes (old presets, data files or calibrations no longer valid) bump
-MAJOR, new features bump MINOR, and bug fixes bump PATCH.
+**Version 1.6.1.** Pattern-run analysis now time-gates the data (fix to 1.6.0, which showed ungated phase).
+1.6.0 added voltage pattern scans (a new feature, so a minor-version step from 1.5.0).
+Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old presets, data files or calibrations
+no longer valid) bump MAJOR, new features bump MINOR, and bug fixes bump PATCH.
 
 ## Files
 
@@ -30,6 +30,7 @@ MAJOR, new features bump MINOR, and bug fixes bump PATCH.
 - `settings_tab.py` — GUI tab 1: Settings & Configuration (`SettingsTab`)
 - `scan_tab.py` — GUI tab 2: Scan (`ScanTab`) — live geometry preview, progress bar, Start/Stop
 - `debug_tab.py` — GUI tab 3: Debug (`DebugTab`) — manual stage jog + board-wide voltage set
+- `pattern.py` — reads voltage pattern CSVs (one voltage per element, by pinout name, list or grid)
 - `analysis.py` — dataset loading, time gating and phase/magnitude processing for the Analysis tab (adapted from `ElementToElementPTV.py`; no GUI code)
 - `analysis_tab.py` — GUI tab 4: Analysis (`AnalysisTab`) — board heatmap and per-element 2x2 plots
 - `gui_app.py` — GUI entry point; run this directly (`python gui_app.py`)
@@ -222,6 +223,56 @@ linking, tab-switch refresh, and a complete scan from Start through 100% through
 by extending the same fake-tkinter harness from before with a stub for matplotlib's
 Tk-specific canvas (the real `Figure`/`Axes` still does the actual plotting inside it) and
 actually running the real background thread to completion.
+
+## Voltage pattern scans (V1.6.0)
+
+Settings > General > **Scan type: Voltage pattern (CSV)** sets each element to its own voltage from
+a CSV, once, then measures every element of the scanned density (L or H) a single time. There is no
+voltage sweep and no reference: each element's file holds one raw measurement.
+
+**Element names** are the pinout's, 1-indexed: L elements are `E1_1` .. `E32_32`, H elements are
+`H1_1` .. `H64_32` (`L1_1` and `H_1_1` spellings also work). `H1_1` is H row 0, column 0 in the
+0-indexed numbering used by file names and the Analysis tab.
+
+**CSV layouts** (`pattern.py`):
+- **Labelled:** rows of `element name, voltage`, e.g. `H1_1, 2.5`. May mix E and H elements. Any
+  element left out is set to 0 V.
+- **One column (or one row):** one voltage per element of the scanned density, row by row: the first
+  value goes to H1_1, then H1_2 .. H1_32, H2_1, and so on (2048 values for H, 1024 for L).
+- **Grid:** rows x columns of the scanned density (64 x 32 for H, 32 x 32 for L); CSV row r,
+  column c is element row r, column c.
+
+Header lines are skipped. The grey line under the field says what was read (e.g. "2048 H values, 0
+to 7.5 V (by element name)") or, in red, why the file can't be used (wrong count, a voltage outside
+the controller's range, a duplicate or unknown name). Validate and Start refuse an unusable file
+before any hardware moves.
+
+**Hardware:** with the pixel controller, every output is first set to 0 V, then each element in the
+pattern is set through its density's mapping CSV, so the L and/or H mapping CSV must be set for
+whichever densities the pattern names. Elements of the other density not in the file stay at 0 V.
+The Pi controller takes one grid for the scanned density only, so a pattern that sets the other
+density's elements to anything but 0 V is refused. After programming, the scan waits the settle time.
+
+**Saved data:** one file per element as usual, with one measurement (`sdata` shape (1, N)), `e` =
+that element's pattern voltage, plus `scan_type = "pattern"` and `element` (its pinout name). The
+run folder also gets `voltage_pattern_source.csv` (the file as given) and
+`voltage_pattern_applied.csv` (all 3072 elements, name, row, column, and the voltage actually
+set), and `metadata.json` records `scan_mode: "voltage_pattern"`.
+
+**Analysis:** the Analysis tab recognises a pattern run. Each element is time-gated with the same
+gate settings as sweep runs (Processing options), but nothing is subtracted: no linear trend, no
+first-voltage reference. The heatmap offers **Phase, no reference** (the gated phase, -180 to 180
+deg, drawn with a cyclic colour scale since -180 and +180 are the same phase), **Gated magnitude**,
+and **Applied voltage** (the pattern itself, to check it went where intended). Selecting an element
+shows its gated phase and magnitude vs frequency with the heatmap frequency marked. The phase
+reference option is greyed out.
+
+Verified: pattern files built from the real pinout labels load in all three layouts, and bad files
+are rejected with the reasons above; with the pinout's L and H mapping CSVs, all 3072 controller
+outputs end at exactly their element's voltage; a pattern scan run from the GUI completes and saves
+the files above; and on a synthetic pattern run with a known phase for every element plus a late reflection,
+the gated-phase heatmap recovers each element's direct-path phase (the reflection gated out) and
+the applied-voltage heatmap matches the pattern exactly.
 
 ## Analysis tab
 

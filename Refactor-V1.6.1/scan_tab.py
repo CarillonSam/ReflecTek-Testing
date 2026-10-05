@@ -34,6 +34,7 @@ class ScanTab(ttk.Frame):
 
         self._queue: queue.Queue = queue.Queue()
         self._scan_thread: threading.Thread | None = None
+        self._scan_type = "sweep"
         self._cancel_event: threading.Event | None = None
         self._polling = False
 
@@ -154,6 +155,7 @@ class ScanTab(ttk.Frame):
             return
 
         self._set_points(HexGridPlanner(config.geometry).all_points(), config.geometry.spacing_mm, config.geometry.density_mode)
+        self._scan_type = config.scan_type
         self.progress_var.set(0.0)
         self.progress_label.configure(text="0%")
         self.voltage_label.configure(text="")
@@ -207,8 +209,13 @@ class ScanTab(ttk.Frame):
             pct = 100.0 * event.step / event.total_steps if event.total_steps else 0.0
             self.progress_var.set(pct)
             self.progress_label.configure(text=f"{pct:.0f}%")
+            from pattern import element_label
+            text = (f"Voltage {event.voltage_index + 1}/{event.voltage_count}: {event.voltage_v:.3f} V"
+                    if self._scan_type == "sweep" else
+                    f"{element_label(event.point.density, event.point.logical_row, event.point.logical_col)}: "
+                    f"{event.voltage_v:.3f} V")
             self.voltage_label.configure(
-                text=f"Voltage {event.voltage_index + 1}/{event.voltage_count}: {event.voltage_v:.3f} V"
+                text=text
             )
             self._mark_scanned(event.point)
             self._update_stage_box(event.point.stage_x_mm, event.point.stage_y_mm)

@@ -147,6 +147,34 @@ class PixelController(BoardController):
             self.comm.close()
             raise
         self._last_grid: Optional[np.ndarray] = None
+        self._density_maps: dict[str, ElementToControllerMap] = {}
+
+    def _map_for(self, density: str) -> ElementToControllerMap:
+        """The L or H element map, loaded the first time it's needed."""
+        if density not in self._density_maps:
+            path = self.config.mapping_csv_l if density == "L" else self.config.mapping_csv_h
+            if not path:
+                field_name = "mapping_csv_l" if density == "L" else "mapping_csv_h"
+                raise RuntimeError(
+                    f"The voltage pattern sets {density} elements, which needs the {density} mapping CSV "
+                    f"(pixels.{field_name}, 'L/H mapping CSV' in General settings)."
+                )
+            self._density_maps[density] = ElementToControllerMap.from_csv(path)
+        return self._density_maps[density]
+
+    def apply_pattern(self, voltages: dict, default_v: float = 0.0) -> None:
+        """
+        Sets the whole board: every output to default_v first (one broadcast), then each
+        element in `voltages` ({(density, row, col): volts}, 0-indexed) to its own value,
+        addressed through that density's mapping CSV. Elements of the other density that
+        aren't in `voltages` stay at default_v.
+        """
+        assignments = [(self._map_for(d).get_index(r, c), float(v)) for (d, r, c), v in voltages.items()]
+        self._set_all_pixels(default_v)
+        self._set_pixels(assignments)
+        if self.config.save_to_flash_after_set:
+            self._save_to_flash()
+        self._last_grid = None  # the board no longer matches any single-density grid
 
     def close(self) -> None:
         self.comm.close()

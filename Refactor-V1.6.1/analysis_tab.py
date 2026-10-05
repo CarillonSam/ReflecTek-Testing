@@ -26,7 +26,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 import analysis
-from analysis import HEATMAP_METRICS, PHASE_REFERENCES, AnalysisSettings
+from analysis import HEATMAP_METRICS, PHASE_REFERENCES, RAW_HEATMAP_METRICS, AnalysisSettings
+from pattern import element_label
 
 SELECT_COLOR = "#E24B4A"
 MISSING_COLOR = "#D3D1C7"
@@ -78,18 +79,20 @@ class AnalysisTab(ttk.Frame):
         opts.pack(fill="x")
         ttk.Label(opts, text="Heatmap colour").pack(side="left")
         self.metric_var = tk.StringVar(value=next(iter(HEATMAP_METRICS)))
-        metric = ttk.Combobox(opts, textvariable=self.metric_var, values=list(HEATMAP_METRICS), state="readonly", width=29)
+        self.metric_combo = metric = ttk.Combobox(opts, textvariable=self.metric_var, values=list(HEATMAP_METRICS),
+                                                  state="readonly", width=29)
         metric.pack(side="left", padx=(4, 8))
         metric.bind("<<ComboboxSelected>>", lambda e: self._draw_heatmap())
         ttk.Label(opts, text="at").pack(side="left")
         self.heat_freq_var = tk.StringVar()
         self.heat_freq_combo = ttk.Combobox(opts, textvariable=self.heat_freq_var, state="readonly", width=8)
         self.heat_freq_combo.pack(side="left", padx=4)
-        self.heat_freq_combo.bind("<<ComboboxSelected>>", lambda e: self._draw_heatmap())
+        self.heat_freq_combo.bind("<<ComboboxSelected>>", lambda e: self._on_heat_freq_changed())
         ttk.Label(opts, text="GHz").pack(side="left", padx=(0, 12))
         ttk.Label(opts, text="Phase reference").pack(side="left")
         self.ref_var = tk.StringVar(value="Linear trend")
-        ref = ttk.Combobox(opts, textvariable=self.ref_var, values=list(PHASE_REFERENCES), state="readonly", width=11)
+        self.ref_combo = ref = ttk.Combobox(opts, textvariable=self.ref_var, values=list(PHASE_REFERENCES),
+                                            state="readonly", width=11)
         ref.pack(side="left", padx=4)
         ref.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
         self.proc_button = ttk.Button(opts, text="Processing options", command=self._toggle_processing)
@@ -287,6 +290,13 @@ class AnalysisTab(ttk.Frame):
         if self.heat_freq_var.get() not in choices:
             self.heat_freq_var.set("18.5" if "18.5" in choices else choices[len(choices) // 2])
         self.density_combo.configure(values=ds.densities)
+        # Pattern runs have one measurement per element: raw heatmap options, and no phase
+        # reference (nothing is subtracted).
+        metrics = RAW_HEATMAP_METRICS if ds.scan_type == "pattern" else HEATMAP_METRICS
+        self.metric_combo.configure(values=list(metrics))
+        if self.metric_var.get() not in metrics:
+            self.metric_var.set(next(iter(metrics)))
+        self.ref_combo.configure(state="disabled" if ds.scan_type == "pattern" else "readonly")
         if new_dataset or self.selected not in processed:
             self.density_var.set(ds.densities[0])
             self.selected = min(k for k in processed if k[0] == ds.densities[0])
@@ -318,7 +328,7 @@ class AnalysisTab(ttk.Frame):
         if not self.processed or not self.heat_freq_var.get():
             return
         keys, xy, physical = self._positions()
-        metric = HEATMAP_METRICS[self.metric_var.get()]
+        metric = {**HEATMAP_METRICS, **RAW_HEATMAP_METRICS}[self.metric_var.get()]
         freq = float(self.heat_freq_var.get())
         values = np.array([analysis.heatmap_value(self.processed[k], metric, freq) for k in keys])
         self._plot_keys, self._plot_xy = keys, xy
@@ -335,10 +345,17 @@ class AnalysisTab(ttk.Frame):
         scatters = []
         if (~good).any():
             scatters.append(ax.scatter(xy[~good, 0], xy[~good, 1], c=MISSING_COLOR, marker="H", linewidths=0))
-        sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap=HEATMAP_CMAP, marker="H", linewidths=0)
+        if metric == "raw_phase":
+            # Phase wraps: -180 and +180 deg are the same, so use a cyclic colormap over the full circle.
+            sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap="twilight", vmin=-180, vmax=180,
+                            marker="H", linewidths=0)
+        else:
+            sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap=HEATMAP_CMAP, marker="H", linewidths=0)
         scatters.append(sc)
         self._colorbar = self.heat_fig.colorbar(sc, ax=ax, orientation="horizontal", shrink=0.9, aspect=30)
         self._colorbar.ax.tick_params(labelsize=8)
+        if metric == "raw_phase":
+            self._colorbar.set_ticks([-180, -90, 0, 90, 180])
         ax.set_title(f"{self.metric_var.get()}\nat {freq:g} GHz", fontsize=9)
         ax.set_xlabel("Stage X (mm)" if physical else "Column", fontsize=8)
         ax.set_ylabel("Stage Y (mm)" if physical else "Row (negated)", fontsize=8)
@@ -357,6 +374,11 @@ class AnalysisTab(ttk.Frame):
         if ring is not None:
             ring.set_sizes([size * 2.2])
         self.heat_canvas.draw_idle()
+
+    def _on_heat_freq_changed(self) -> None:
+        self._draw_heatmap()
+        if self.selected in self.processed and self.processed[self.selected].raw:
+            self._show(self.selected)  # moves the frequency marker on the raw plots
 
     def _on_heat_click(self, event) -> None:
         if event.inaxes is not self.heat_ax or event.xdata is None or not self._plot_keys:
@@ -403,6 +425,9 @@ class AnalysisTab(ttk.Frame):
         fig = self.summary_fig
         _fit(self.summary_canvas)
         fig.clear()
+        if p.raw:
+            self._show_raw(key, p, el, fig)
+            return
         axes = fig.subplots(2, 2)
         _draw_vs_voltage(axes[0, 0], p, phase=True, ylabel=_phase_label(self.settings))
         _draw_vs_voltage(axes[0, 1], p, phase=False, ylabel="Magnitude (dB)")
@@ -410,6 +435,28 @@ class AnalysisTab(ttk.Frame):
         _draw_vs_frequency(axes[1, 1], p, p.gated_mag_db, "Gated magnitude (dB)", "Magnitude vs. frequency")
         axes[1, 1].set_ylim(-50, 1)  # as the original script
         fig.suptitle(f"{key[0]} element, row {key[1]}, column {key[2]}  ({el.file_name})", fontsize=10)
+        self.summary_canvas.draw_idle()
+
+    def _show_raw(self, key, p, el, fig) -> None:
+        """Pattern runs: the element's gated phase (no reference subtracted) and gated magnitude
+        vs frequency, with the heatmap frequency marked."""
+        axes = fig.subplots(2, 1, sharex=True)
+        freq = float(self.heat_freq_var.get()) if self.heat_freq_var.get() else None
+        for ax, data, ylabel, title in ((axes[0], p.phase_rel[0], "Phase, no reference (deg)", "Gated phase vs. frequency"),
+                                        (axes[1], p.gated_mag_db[0], "Gated magnitude (dB)", "Gated magnitude vs. frequency")):
+            ax.plot(p.freqs_ghz, data, lw=1.0, color="#185FA5")
+            if freq is not None:
+                ax.axvline(freq, color=SELECT_COLOR, lw=1, ls="--", label=f"Heatmap frequency ({freq:g} GHz)")
+                ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=False)
+            ax.set_ylabel(ylabel, fontsize=8)
+            ax.set_title(title, fontsize=9)
+            _style(ax)
+        axes[0].set_ylim(-185, 185)
+        axes[0].set_yticks([-180, -90, 0, 90, 180])
+        axes[1].set_xlabel("Frequency (GHz)", fontsize=8)
+        axes[1].set_xlim(p.freqs_ghz[0], p.freqs_ghz[-1])
+        name = element_label(*key)
+        fig.suptitle(f"{name} (row {key[1]}, column {key[2]}) at {p.voltages[0]:g} V  ({el.file_name})", fontsize=10)
         self.summary_canvas.draw_idle()
 
     def _save(self, fig, kind: str) -> None:

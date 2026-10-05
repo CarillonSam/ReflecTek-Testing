@@ -30,7 +30,9 @@ BAND_LABELS = {"lb": "Low band (17-21 GHz)", "hb": "High band (26-30 GHz)"}
 BAND_FROM_LABEL = {v: k for k, v in BAND_LABELS.items()}
 
 # Fields owned by the General section (or derived), so Advanced skips them.
-GENERAL_RUN_FIELDS = {"voltages_v", "controller_type", "band", "uniform_board_settle_s"}
+GENERAL_RUN_FIELDS = {"voltages_v", "controller_type", "band", "uniform_board_settle_s", "scan_type", "pattern_csv"}
+SCAN_TYPE_LABELS = {"sweep": "Voltage sweep", "pattern": "Voltage pattern (CSV)"}
+SCAN_TYPE_FROM_LABEL = {v: k for k, v in SCAN_TYPE_LABELS.items()}
 GENERAL_GEOMETRY_FIELDS = {"rows", "cols", "spacing_mm", "density_mode", "l_subgrid", "stagger_sign"}
 GENERAL_STAGE_FIELDS = {"calibration_file"}
 GENERAL_PIXEL_FIELDS = {"mapping_csv_l", "mapping_csv_h"}
@@ -61,7 +63,7 @@ KIND_HINTS = {
 }
 # Friendly names for General fields in validation messages (Advanced uses the variable name).
 GENERAL_LABELS = {
-    "voltages_v": "Voltages", "uniform_board_settle_s": "Settle time",
+    "voltages_v": "Voltages", "uniform_board_settle_s": "Settle time", "pattern_csv": "Pattern CSV",
     "geometry.rows": "Rows", "geometry.cols": "Columns", "geometry.spacing_mm": "Full-grid spacing",
     "save.output_dir": "Output directory", "save.run_name": "Run name",
     "stage.calibration_file": "Stage calibration file",
@@ -193,6 +195,12 @@ class SettingsTab(ttk.Frame):
     def _browse(self, key: str) -> None:
         if key == "save.output_dir":
             path = filedialog.askdirectory()
+        elif key == "pattern_csv":
+            path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+            if path:
+                self.vars[key].set(path)
+                self._update_pattern_summary()
+            return
         elif key == "stage.calibration_file":
             # May not exist yet (it's where calibration will be written), so a save dialog.
             path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")],
@@ -221,7 +229,17 @@ class SettingsTab(ttk.Frame):
         self.vna_summary = ttk.Label(frame, text="", foreground="gray50")
         self.vna_summary.grid(row=r, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 6)); r += 1
 
-        self._add_field(frame, r, "Voltages (V)", "voltages_v", "voltages", hint="comma-separated"); r += 1
+        self.scan_type_var = tk.StringVar(value=SCAN_TYPE_LABELS["sweep"])
+        self._add_choice(frame, r, "Scan type", self.scan_type_var, list(SCAN_TYPE_LABELS.values()),
+                         self._on_scan_type_changed); r += 1
+        # Sweep: the voltage list. Pattern: the CSV, plus a line saying what was read from it.
+        self._voltage_row = self._add_field(frame, r, "Voltages (V)", "voltages_v", "voltages", hint="comma-separated")
+        self._pattern_row = self._add_field(frame, r, "Pattern CSV", "pattern_csv", "path_opt",
+                                            on_change=self._update_pattern_summary)
+        r += 1
+        self.pattern_summary = ttk.Label(frame, text="", foreground="gray50", wraplength=560, justify="left")
+        self.pattern_summary.grid(row=r, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 4))
+        self._pattern_row.append(self.pattern_summary); r += 1
         self._add_field(frame, r, "Settle time (s)", "uniform_board_settle_s", "float",
                         hint="wait after setting voltages"); r += 1
 
@@ -250,6 +268,36 @@ class SettingsTab(ttk.Frame):
             self._add_field(frame, r + 1, "H mapping CSV", "pixels.mapping_csv_h", "path_opt", hint="pixel controller only"),
         ]
         r += 2
+
+    def _on_scan_type_changed(self) -> None:
+        pattern = SCAN_TYPE_FROM_LABEL[self.scan_type_var.get()] == "pattern"
+        for w in self._voltage_row:
+            w.grid_remove() if pattern else w.grid()
+        for w in self._pattern_row:
+            w.grid() if pattern else w.grid_remove()
+        if pattern:
+            self._update_pattern_summary()
+
+    def _update_pattern_summary(self) -> None:
+        """Reads the pattern CSV (if any) with the current geometry and says what it found,
+        or why it can't be used, so problems show up before a scan is started."""
+        path = str(self.vars["pattern_csv"].get()).strip()
+        if not path:
+            self.pattern_summary.configure(text="Choose a CSV: element names (H1_1, E1_1) with voltages, one "
+                                                "column in row order (first value = H1_1), or a rows x columns grid.",
+                                           foreground="gray50")
+            return
+        geometry = self.get_geometry_or_none()
+        if geometry is None:
+            return
+        try:
+            from pattern import load_pattern
+            pixels_min = float(self.vars["pixels.min_voltage_v"].get())
+            pixels_max = float(self.vars["pixels.max_voltage_v"].get())
+            text, color = load_pattern(path, geometry, pixels_min, pixels_max).describe(), "gray30"
+        except ValueError as e:
+            text, color = str(e), "#B3261E"
+        self.pattern_summary.configure(text=text, foreground=color)
 
     def _on_band_changed(self) -> None:
         """Loads the selected band's default sweep into the Advanced VNA fields."""
@@ -521,6 +569,16 @@ class SettingsTab(ttk.Frame):
             errors.append("vna.points must be at least 2")
         if vna.start_hz >= vna.stop_hz:
             errors.append("vna.start_hz must be below vna.stop_hz")
+        scan_type = SCAN_TYPE_FROM_LABEL[self.scan_type_var.get()]
+        if scan_type == "pattern":
+            if top.get("pattern_csv") is None:
+                errors.append("Pattern CSV is required for a voltage pattern scan")
+            else:
+                from pattern import load_pattern
+                try:
+                    load_pattern(top["pattern_csv"], geometry, pixels.min_voltage_v, pixels.max_voltage_v)
+                except ValueError as e:
+                    errors.append(f"Pattern CSV: {e}")
         if require_save:
             if str(save.output_dir).strip() in ("", "."):
                 errors.append("Output directory is required")
@@ -534,6 +592,7 @@ class SettingsTab(ttk.Frame):
             t, stage=stage, pixels=pixels, pi=pi, vna=vna, geometry=geometry, save=save,
             controller_type=self.controller_type_var.get(),
             band=BAND_FROM_LABEL[self.band_var.get()],
+            scan_type=scan_type,
             **top,
         )
 
@@ -554,6 +613,8 @@ class SettingsTab(ttk.Frame):
         self.vars["geo_stagger_mirror"].set(config.geometry.stagger_sign < 0)
         self.controller_type_var.set(config.controller_type)
         self.band_var.set(BAND_LABELS.get(config.band, BAND_LABELS["lb"]))
+        self.scan_type_var.set(SCAN_TYPE_LABELS.get(config.scan_type, SCAN_TYPE_LABELS["sweep"]))
+        self._on_scan_type_changed()
         self.density_mode_var.set(config.geometry.density_mode)
         self.l_subgrid_var.set(str(config.geometry.l_subgrid))
 
@@ -564,3 +625,8 @@ class SettingsTab(ttk.Frame):
     def _notify_geometry_change(self) -> None:
         if self.on_geometry_change is not None:
             self.on_geometry_change()
+        # The pattern check depends on the geometry (e.g. L vs H changes how many values a
+        # one-column file needs), so refresh it too.
+        if hasattr(self, "pattern_summary") and "pixels.min_voltage_v" in self.vars \
+                and SCAN_TYPE_FROM_LABEL[self.scan_type_var.get()] == "pattern":
+            self._update_pattern_summary()

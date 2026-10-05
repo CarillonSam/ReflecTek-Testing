@@ -66,7 +66,11 @@ def config_to_dict(config: RunConfig) -> dict:
     for f in fields(RunConfig):
         if f.name not in _SUBCONFIGS:
             v = getattr(config, f.name)
-            out[f.name] = list(v) if f.name == "voltages_v" else v
+            if f.name == "voltages_v":
+                v = list(v)
+            elif isinstance(v, Path):
+                v = str(v)
+            out[f.name] = v
     return out
 
 
@@ -75,7 +79,12 @@ def config_from_dict(data: dict) -> RunConfig:
     for f in fields(RunConfig):
         if f.name in _SUBCONFIGS or f.name not in data:
             continue  # missing top-level keys fall back to RunConfig's own defaults
-        kwargs[f.name] = tuple(data[f.name]) if f.name == "voltages_v" else data[f.name]
+        value = data[f.name]
+        if f.name == "voltages_v":
+            value = tuple(value)
+        elif f.name == "pattern_csv" and value is not None:
+            value = Path(value)
+        kwargs[f.name] = value
     # Presets saved before RunConfig.band existed kept the band only in pi.active_band.
     if "band" not in data and "active_band" in data.get("pi", {}):
         kwargs["band"] = data["pi"]["active_band"]

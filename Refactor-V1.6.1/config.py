@@ -11,7 +11,7 @@ class StageConfig:
     baud: int = 115200
     feed_mm_per_min: float = 500.0
     settle_s: float = 0.1
-    position_tolerance_mm: float = 0.01
+    position_tolerance_mm: float = 0.06
     readback_poll_s: float = 0.1
     startup_delay_s: float = 2.0
 
@@ -19,8 +19,8 @@ class StageConfig:
     # feed_mm_per_min, times move_timeout_factor, plus move_timeout_extra_s (covers
     # acceleration and status-poll latency). Long diagonal moves get proportionally
     # longer, so a big array or a slow feed can't time out while the stage is still moving.
-    move_timeout_factor: float = 1.5
-    move_timeout_extra_s: float = 10.0
+    move_timeout_factor: float = 1.7
+    move_timeout_extra_s: float = 15.0
 
     # JSON file with saved scale/skew calibration coefficients (see calibrate_stage.py).
     # If unset or the file doesn't exist yet, moves are uncalibrated (identity transform).
@@ -29,7 +29,7 @@ class StageConfig:
 
 @dataclass
 class PixelControllerConfig:
-    port: str = "COM7"
+    port: str = "COM11"
     baud: int = 115200
     timeout_s: float = 0.1
     ack_timeout_ping_s: float = 2.0
@@ -67,7 +67,7 @@ class VNAConfig:
     stop_hz: float = 21e9
     points: int = 4001
     dwell_s: float = 0.0
-    visa_resource: str = "TCPIP0::192.168.6.150::inst0::INSTR"
+    visa_resource: str = "TCPIP0::169.254.232.150::inst0::INSTR"
     visa_timeout_ms: float = 100000
     # '@py' = pyvisa-py, the pure-Python backend (no NI-VISA/vendor driver install needed).
     # Set to '' for pyvisa's default (NI-VISA or another installed vendor backend).
@@ -96,7 +96,7 @@ class ScanGeometryConfig:
 
     offset_odd_rows: bool = True  # alternates which full-grid rows get the half-pitch horizontal offset
     stagger_sign: float = 1.0  # +1.0 (default) offsets rows to the right; -1.0 mirrors it to the left
-    x_direction_sign: float = -1.0
+    x_direction_sign: float = 1.0
     y_direction_sign: float = -1.0
     serpentine: bool = True  # alternate scan direction each row, to minimize stage travel
 
@@ -137,7 +137,7 @@ class PiControllerConfig:
     lb_shape: tuple[int, int] = (24, 8)  # (rows, cols) for DataLB.csv when it's the inactive band
 
     min_voltage_v: float = 0.0
-    max_voltage_v: float = 10.0
+    max_voltage_v: float = 10.05
 
 
 @dataclass
@@ -170,6 +170,12 @@ class RunConfig:
     # Which BoardController implementation to use: "pixel" (PixelController, serial
     # protocol) or "pi" (PiBoardController, SSH file-upload to a Raspberry Pi).
     controller_type: str = "pixel"
+
+    # "sweep": step every element through voltages_v together (the usual scan).
+    # "pattern": set each element to its own voltage from pattern_csv once, then measure
+    # every element of the scanned density a single time (see pattern.py for CSV layouts).
+    scan_type: str = "sweep"
+    pattern_csv: Path | None = None
 
     # RF band for this run: "lb" (low band) or "hb" (high band). The single source of
     # truth for band: pi.active_band is synced from it automatically, and the GUI loads

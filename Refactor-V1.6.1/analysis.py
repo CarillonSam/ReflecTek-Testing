@@ -23,6 +23,7 @@ Changes from the original script:
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -40,6 +41,13 @@ HEATMAP_METRICS = {
     "Phase range across voltage (deg)": "phase_range",
     "Phase at last voltage (deg)": "phase_last",
     "Magnitude range across voltage (dB)": "mag_range",
+}
+# Voltage pattern runs (one measurement per element, no voltage axis): time-gated, but with
+# no reference subtracted.
+RAW_HEATMAP_METRICS = {
+    "Phase, no reference (deg)": "raw_phase",
+    "Gated magnitude (dB)": "raw_mag",
+    "Applied voltage (V)": "applied_v",
 }
 PHASE_REFERENCES = {
     "Linear trend": "linear_trend",
@@ -86,6 +94,7 @@ class Element:
     freqs_ghz: np.ndarray         # (n_freq,)
     position_mm: tuple[float, float] | None
     file_name: str
+    scan_type: str = "sweep"   # "pattern" for voltage pattern runs
 
     @property
     def key(self) -> tuple[str, int, int]:
@@ -97,6 +106,7 @@ class Dataset:
     folder: str
     elements: dict[tuple[str, int, int], Element]
     skipped: list[str]
+    scan_type: str = "sweep"   # "pattern" if this folder is a voltage pattern run
 
     @property
     def densities(self) -> list[str]:
@@ -111,6 +121,8 @@ class Dataset:
         nv = sorted({len(e.voltages) for e in self.elements.values()})
         nv_text = f"{nv[0]}" if len(nv) == 1 else f"{nv[0]}-{nv[-1]}"
         text = f"{counts} elements, {nv_text} voltages, {f[0]:g}-{f[-1]:g} GHz ({len(f)} points)"
+        if self.scan_type == "pattern":
+            text = f"Voltage pattern run: {counts} elements, one measurement each, {f[0]:g}-{f[-1]:g} GHz ({len(f)} points)"
         if self.skipped:
             text += f"; skipped {len(self.skipped)} file(s)"
         return text
@@ -180,8 +192,9 @@ def load_element(path: str, settings: AnalysisSettings) -> Element:
         position = None
         if "stage_x_mm" in keys and "stage_y_mm" in keys:
             position = (float(z["stage_x_mm"]), float(z["stage_y_mm"]))
+        scan_type = str(z["scan_type"]) if "scan_type" in keys else "sweep"
 
-    return Element(density, row, col, voltages, sdata, freqs_ghz, position, name)
+    return Element(density, row, col, voltages, sdata, freqs_ghz, position, name, scan_type)
 
 
 def load_dataset(folder: str, settings: AnalysisSettings) -> Dataset:
@@ -197,7 +210,18 @@ def load_dataset(folder: str, settings: AnalysisSettings) -> Dataset:
             skipped.append(f"{os.path.basename(path)}: {e}")
             continue
         elements[el.key] = el
-    return Dataset(folder, elements, skipped)
+    scan_type = "sweep"
+    meta_path = os.path.join(folder, "metadata.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                if json.load(f).get("scan_mode") == "voltage_pattern":
+                    scan_type = "pattern"
+        except (OSError, ValueError):
+            pass
+    if any(el.scan_type == "pattern" for el in elements.values()):
+        scan_type = "pattern"
+    return Dataset(folder, elements, skipped, scan_type)
 
 
 # ============================================================================ processing
@@ -234,6 +258,7 @@ class Processed:
     phase_rel: np.ndarray      # (n_v, n_f), unwrapped, relative to the chosen reference
     ref_freqs_ghz: list[float]
     ref_indices: list[int]     # nearest frequency index for each reference frequency
+    raw: bool = False          # True for pattern runs: phase/magnitude straight from the VNA
 
     def phase_at(self, idx: int) -> np.ndarray:
         return self.phase_rel[:, idx]
@@ -260,10 +285,28 @@ def process_element(el: Element, settings: AnalysisSettings) -> Processed:
     return Processed(el.voltages, el.freqs_ghz, mag_db, phase_rel, list(refs), idx)
 
 
+def process_raw(el: Element, settings: AnalysisSettings) -> Processed:
+    """Pattern runs: time-gated exactly as the sweep analysis (same gate settings), but with
+    no reference subtracted. Phase is the gated phase in degrees, wrapped to -180..180."""
+    gated = _gate(el.sdata, settings.gate_start_samples, settings.gate_stop_samples, settings.gate_alpha)
+    with np.errstate(divide="ignore"):
+        mag_db = 20 * np.log10(np.abs(gated))
+    phase = np.degrees(np.angle(gated))
+    refs = settings.ref_freqs_ghz or default_ref_freqs(el.freqs_ghz)
+    idx = [int(np.argmin(np.abs(el.freqs_ghz - f))) for f in refs]
+    return Processed(el.voltages, el.freqs_ghz, mag_db, phase, list(refs), idx, raw=True)
+
+
 def heatmap_value(p: Processed, metric: str, ref_freq_ghz: float) -> float:
     """One number per element for the heatmap, at the frequency nearest ref_freq_ghz."""
     idx = int(np.argmin(np.abs(p.freqs_ghz - ref_freq_ghz)))
     phase, mag = p.phase_at(idx), p.mag_db_at(idx)
+    if metric == "raw_phase":
+        return float(phase[0])
+    if metric == "raw_mag":
+        return float(mag[0])
+    if metric == "applied_v":
+        return float(p.voltages[0])
     if metric == "phase_last":
         return float(phase[-1])
     if len(phase) < 2:
@@ -277,8 +320,9 @@ def process_dataset(ds: Dataset, settings: AnalysisSettings, progress=None) -> d
     """Processes every element; returns {key: Processed}. progress(done, total) is called
     as it goes, if given."""
     out, total = {}, len(ds.elements)
+    process = process_raw if ds.scan_type == "pattern" else process_element
     for i, (key, el) in enumerate(ds.elements.items(), start=1):
-        out[key] = process_element(el, settings)
+        out[key] = process(el, settings)
         if progress and (i % 25 == 0 or i == total):
             progress(i, total)
     return out

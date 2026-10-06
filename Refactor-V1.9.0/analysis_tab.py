@@ -24,15 +24,20 @@ import matplotlib.colors
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-import matplotlib.colors as mcolors
 
 import analysis
-from analysis import HEATMAP_METRICS, PHASE_REFERENCES, RAW_HEATMAP_METRICS, AnalysisSettings
+from analysis import (CAL_HEATMAP_METRICS, CORRECTIONS, HEATMAP_METRICS, PHASE_REFERENCES, RAW_HEATMAP_METRICS,
+                      AnalysisSettings)
 from pattern import element_label
 
 SELECT_COLOR = "#E24B4A"
 MISSING_COLOR = "#D3D1C7"
-HEATMAP_CMAP = "viridis"
+HEATMAP_CMAP = "viridis"   # every heatmap (voltage, phase, magnitude, gap) uses this one colour scheme
+# Applied-voltage heatmaps use a logistic colour scale, matching the S-shaped (logistic) way an
+# element's phase responds to voltage, so equal colour steps are roughly equal steps along that
+# curve. Midpoint/width are editable under Processing options; these are only starting values.
+LOGISTIC_MIDPOINT_V = 5.0
+LOGISTIC_WIDTH_V = 1.5
 VOLTAGE_CMAP = "cool"       # lines on the two vs-voltage plots (one per reference frequency)
 FREQUENCY_CMAP = "viridis"  # lines on the two vs-frequency plots (one per voltage)
 
@@ -41,7 +46,8 @@ class AnalysisTab(ttk.Frame):
     def __init__(self, parent, settings_tab=None):
         super().__init__(parent)
         self.settings_tab = settings_tab
-        self.dataset: analysis.Dataset | None = None
+        self.raw_dataset: analysis.Dataset | None = None  # the run as loaded, before any correction
+        self.dataset: analysis.Dataset | None = None      # what's shown (raw, or surface-calibrated)
         self.processed: dict = {}
         self.settings = AnalysisSettings()
         self.selected: tuple[str, int, int] | None = None
@@ -52,6 +58,7 @@ class AnalysisTab(ttk.Frame):
         self._plot_xy = np.zeros((0, 2))
 
         self._build_controls()
+        self._sync_correction_controls("gate")
         self._build_plots()
         self._draw_empty()
 
@@ -68,6 +75,26 @@ class AnalysisTab(ttk.Frame):
         ttk.Button(top, text="Browse...", command=self._browse).grid(row=0, column=2, padx=2)
         ttk.Button(top, text="Load", command=self.load).grid(row=0, column=3, padx=2)
         top.grid_columnconfigure(1, weight=1)
+
+        # Correction: time-domain gate (default), or the copper-plate surface calibration's
+        # output folder (one <element>_cal.npz per element, from the calibration script).
+        corr = ttk.Frame(self, padding=(10, 6, 10, 0))
+        corr.pack(fill="x")
+        ttk.Label(corr, text="Correction").grid(row=0, column=0, sticky="w")
+        self.correction_var = tk.StringVar(value="Time-domain gate")
+        radios = ttk.Frame(corr)
+        radios.grid(row=0, column=1, sticky="w", padx=6)
+        for label in CORRECTIONS:
+            ttk.Radiobutton(radios, text=label, value=label, variable=self.correction_var,
+                            command=self._on_correction_changed).pack(side="left", padx=(0, 10))
+        ttk.Label(corr, text="Calibration folder").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.cal_folder_var = tk.StringVar()
+        self.cal_entry = ttk.Entry(corr, textvariable=self.cal_folder_var, width=50)
+        self.cal_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=(4, 0))
+        self.cal_entry.bind("<Return>", lambda e: self._on_correction_changed())
+        self.cal_browse = ttk.Button(corr, text="Browse...", command=self._browse_cal)
+        self.cal_browse.grid(row=1, column=2, padx=2, pady=(4, 0))
+        corr.grid_columnconfigure(1, weight=1)
 
         status = ttk.Frame(self, padding=(10, 4, 10, 0))
         status.pack(fill="x")
@@ -101,8 +128,8 @@ class AnalysisTab(ttk.Frame):
 
         # Processing options (collapsed by default): reference frequencies and gate settings.
         self.proc_frame = proc = ttk.Frame(self, padding=(10, 6, 10, 0))
-        row1, row2 = ttk.Frame(proc), ttk.Frame(proc)
-        row1.pack(fill="x"); row2.pack(fill="x", pady=(4, 0))
+        row1, row2, row3 = ttk.Frame(proc), ttk.Frame(proc), ttk.Frame(proc)
+        row1.pack(fill="x"); row2.pack(fill="x", pady=(4, 0)); row3.pack(fill="x", pady=(4, 0))
         proc = row1
         ttk.Label(proc, text="Reference frequencies (GHz)").pack(side="left")
         self.ref_freqs_var = tk.StringVar()
@@ -110,14 +137,28 @@ class AnalysisTab(ttk.Frame):
         proc = row2
         ttk.Label(proc, text="Gate: samples before peak").pack(side="left")
         self.gate_start_var = tk.StringVar(value=str(self.settings.gate_start_samples))
-        ttk.Entry(proc, textvariable=self.gate_start_var, width=4).pack(side="left", padx=(4, 6))
+        self._gate_widgets = [ttk.Entry(proc, textvariable=self.gate_start_var, width=4)]
+        self._gate_widgets[-1].pack(side="left", padx=(4, 6))
         ttk.Label(proc, text="after").pack(side="left")
         self.gate_stop_var = tk.StringVar(value=str(self.settings.gate_stop_samples))
-        ttk.Entry(proc, textvariable=self.gate_stop_var, width=4).pack(side="left", padx=(4, 6))
+        self._gate_widgets.append(ttk.Entry(proc, textvariable=self.gate_stop_var, width=4))
+        self._gate_widgets[-1].pack(side="left", padx=(4, 6))
         ttk.Label(proc, text="Tukey alpha").pack(side="left")
         self.gate_alpha_var = tk.StringVar(value=str(self.settings.gate_alpha))
-        ttk.Entry(proc, textvariable=self.gate_alpha_var, width=5).pack(side="left", padx=(4, 8))
+        self._gate_widgets.append(ttk.Entry(proc, textvariable=self.gate_alpha_var, width=5))
+        self._gate_widgets[-1].pack(side="left", padx=(4, 8))
         ttk.Button(proc, text="Reprocess", command=self.reprocess).pack(side="left")
+
+        # Logistic colour scale for applied-voltage heatmaps (display only: redraws, no reprocessing).
+        ttk.Label(row3, text="Voltage colour scale (logistic): midpoint").pack(side="left")
+        self.logistic_mid_var = tk.StringVar(value=f"{LOGISTIC_MIDPOINT_V:g}")
+        self.logistic_width_var = tk.StringVar(value=f"{LOGISTIC_WIDTH_V:g}")
+        for var, unit in ((self.logistic_mid_var, "V   width"), (self.logistic_width_var, "V")):
+            entry = ttk.Entry(row3, textvariable=var, width=5)
+            entry.pack(side="left", padx=(4, 4))
+            entry.bind("<Return>", lambda e: self._draw_heatmap())
+            entry.bind("<FocusOut>", lambda e: self._draw_heatmap())
+            ttk.Label(row3, text=unit).pack(side="left", padx=(0, 6))
 
         self.sel_frame = sel = ttk.Frame(self, padding=(10, 6, 10, 4))
         sel.pack(fill="x")
@@ -175,15 +216,22 @@ class AnalysisTab(ttk.Frame):
     # ---------------------------------------------------------------- dataset ----
 
     def on_shown(self) -> None:
-        """Called when the tab is selected: suggests the current run's folder if the
-        folder box is still empty."""
-        if self.folder_var.get().strip() or self.settings_tab is None:
+        """Called when the tab is selected: suggests the current run's folder and the saved
+        surface calibration set, if those boxes are still empty."""
+        if self.settings_tab is None:
             return
         try:
-            save = self.settings_tab.get_config(require_save=False).save
-            self.folder_var.set(str(save.output_dir / save.run_name))
+            config = self.settings_tab.get_config(require_save=False)
         except Exception:
-            pass
+            return
+        if not self.folder_var.get().strip():
+            self.folder_var.set(str(config.save.output_dir / config.save.run_name))
+        # The newest surface calibration set saved by the calibration walkthrough, if any.
+        if not self.cal_folder_var.get().strip():
+            import surface_cal
+            latest = surface_cal.latest_set(surface_cal.sets_folder(config.stage))
+            if latest is not None:
+                self.cal_folder_var.set(str(latest))
 
     def _browse(self) -> None:
         start = self.folder_var.get().strip()
@@ -203,6 +251,8 @@ class AnalysisTab(ttk.Frame):
                 gate_alpha=float(self.gate_alpha_var.get()),
                 phase_reference=PHASE_REFERENCES[self.ref_var.get()],
                 ref_freqs_ghz=[] if ref_text == self._auto_ref_text else refs,
+                correction=CORRECTIONS[self.correction_var.get()],
+                cal_folder=self.cal_folder_var.get().strip(),
             )
         except ValueError:
             messagebox.showerror("Invalid analysis settings",
@@ -216,23 +266,68 @@ class AnalysisTab(ttk.Frame):
             messagebox.showerror("No folder", "Enter or browse to a dataset folder first.")
             return
         settings = self._settings_from_form()
-        if settings is not None:
+        if settings is not None and self._cal_folder_ok(settings):
             self._start(lambda progress: self._work_load(folder, settings, progress), f"Loading {folder}...")
 
     def reprocess(self) -> None:
-        if self.dataset is None:
+        if self.raw_dataset is None:
             return
         settings = self._settings_from_form()
-        if settings is not None:
-            ds = self.dataset
-            self._start(lambda progress: (ds, analysis.process_dataset(ds, settings, progress), settings),
-                        "Reprocessing...")
+        if settings is not None and self._cal_folder_ok(settings):
+            raw = self.raw_dataset
+            self._start(lambda progress: self._work_process(raw, settings, progress), "Reprocessing...")
+
+    def _cal_folder_ok(self, settings: AnalysisSettings) -> bool:
+        if settings.correction == "surface_cal" and not settings.cal_folder:
+            messagebox.showerror("No calibration folder",
+                                 "Surface calibration needs the calibration script's output folder (its --out-dir).")
+            self._sync_correction_controls(self.settings.correction)
+            return False
+        return True
 
     def _work_load(self, folder, settings, progress):
-        ds = analysis.load_dataset(folder, settings)
-        for line in ds.skipped:
+        raw = analysis.load_dataset(folder, settings)
+        for line in raw.skipped:
             logging.warning("Analysis: skipped %s", line)
-        return ds, analysis.process_dataset(ds, settings, progress), settings
+        return self._work_process(raw, settings, progress)
+
+    def _work_process(self, raw, settings, progress):
+        """Applies the chosen correction to the loaded run, then processes it (worker thread)."""
+        ds = raw
+        if settings.correction == "surface_cal":
+            ds = analysis.apply_surface_calibration(raw, settings.cal_folder, settings)
+        return raw, ds, analysis.process_dataset(ds, settings, progress), settings
+
+    def _browse_cal(self) -> None:
+        start = self.cal_folder_var.get().strip()
+        start = os.path.dirname(start) if start else ""  # open in the folder holding the sets, to pick another
+        if not os.path.isdir(start) and self.settings_tab is not None:
+            try:
+                import surface_cal
+                start = str(surface_cal.sets_folder(self.settings_tab.get_config(require_save=False).stage) or "")
+            except Exception:
+                start = ""
+        start = start or self.folder_var.get().strip()
+        path = filedialog.askdirectory(initialdir=start if os.path.isdir(start) else None)
+        if path:
+            self.cal_folder_var.set(path)
+            self.correction_var.set("Surface calibration")
+            self._on_correction_changed()
+
+    def _on_correction_changed(self) -> None:
+        self._sync_correction_controls(CORRECTIONS[self.correction_var.get()])
+        if self.raw_dataset is not None:
+            self.reprocess()
+
+    def _sync_correction_controls(self, correction: str) -> None:
+        """Radio buttons, the calibration folder box and the gate settings follow `correction`."""
+        label = next(k for k, v in CORRECTIONS.items() if v == correction)
+        self.correction_var.set(label)
+        cal = correction == "surface_cal"
+        for w in (self.cal_entry, self.cal_browse):
+            w.configure(state="normal" if cal else "disabled")
+        for w in self._gate_widgets:
+            w.configure(state="disabled" if cal else "normal")
 
     def _start(self, work, message: str) -> None:
         if self._busy:
@@ -265,7 +360,8 @@ class AnalysisTab(ttk.Frame):
                 self._busy = False
                 self.progress.pack_forget()
                 if kind == "error":
-                    self.status_label.configure(text="Load failed.")
+                    self._sync_correction_controls(self.settings.correction)
+                    self.status_label.configure(text=self.dataset.describe() if self.dataset else "Load failed.")
                     messagebox.showerror("Analysis failed", payload)
                 else:
                     self._loaded(*payload)
@@ -274,9 +370,10 @@ class AnalysisTab(ttk.Frame):
             pass
         self.after(100, self._poll)
 
-    def _loaded(self, ds: analysis.Dataset, processed: dict, settings: AnalysisSettings) -> None:
-        new_dataset = ds is not self.dataset
-        self.dataset, self.processed, self.settings = ds, processed, settings
+    def _loaded(self, raw: analysis.Dataset, ds: analysis.Dataset, processed: dict, settings: AnalysisSettings) -> None:
+        new_dataset = raw is not self.raw_dataset
+        self.raw_dataset, self.dataset, self.processed, self.settings = raw, ds, processed, settings
+        self._sync_correction_controls(settings.correction)
         self.status_label.configure(text=ds.describe())
         if not processed:
             self._draw_empty("No usable element files in this folder.")
@@ -293,7 +390,9 @@ class AnalysisTab(ttk.Frame):
         self.density_combo.configure(values=ds.densities)
         # Pattern runs have one measurement per element: raw heatmap options, and no phase
         # reference (nothing is subtracted).
-        metrics = RAW_HEATMAP_METRICS if ds.scan_type == "pattern" else HEATMAP_METRICS
+        metrics = dict(RAW_HEATMAP_METRICS if ds.scan_type == "pattern" else HEATMAP_METRICS)
+        if ds.correction == "surface_cal":
+            metrics.update(CAL_HEATMAP_METRICS)  # the warp map the calibration fitted
         self.metric_combo.configure(values=list(metrics))
         if self.metric_var.get() not in metrics:
             self.metric_var.set(next(iter(metrics)))
@@ -329,7 +428,7 @@ class AnalysisTab(ttk.Frame):
         if not self.processed or not self.heat_freq_var.get():
             return
         keys, xy, physical = self._positions()
-        metric = {**HEATMAP_METRICS, **RAW_HEATMAP_METRICS}[self.metric_var.get()]
+        metric = {**HEATMAP_METRICS, **RAW_HEATMAP_METRICS, **CAL_HEATMAP_METRICS}[self.metric_var.get()]
         freq = float(self.heat_freq_var.get())
         values = np.array([analysis.heatmap_value(self.processed[k], metric, freq) for k in keys])
         self._plot_keys, self._plot_xy = keys, xy
@@ -346,18 +445,27 @@ class AnalysisTab(ttk.Frame):
         scatters = []
         if (~good).any():
             scatters.append(ax.scatter(xy[~good, 0], xy[~good, 1], c=MISSING_COLOR, marker="H", linewidths=0))
+        norm, scale_note = None, ""
         if metric == "raw_phase":
-            # Phase wraps: -180 and +180 deg are the same, so use a cyclic colormap over the full circle.
-            sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap="twilight", vmin=-180, vmax=180,
-                            marker="H", linewidths=0, norm=mcolors.LogNorm())
-        else:
-            sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap=HEATMAP_CMAP, marker="H", linewidths=0)
+            norm = matplotlib.colors.Normalize(vmin=-180, vmax=180)  # full circle, so maps are comparable
+        elif metric == "applied_v" and good.any():
+            mid, width = self._logistic_params()
+            vmin, vmax = float(values[good].min()), float(values[good].max())
+            if vmax > vmin:
+                norm = _logistic_norm(mid, width, vmin, vmax)
+                scale_note = f"\nlogistic colour scale (midpoint {mid:g} V, width {width:g} V)"
+        sc = ax.scatter(xy[good, 0], xy[good, 1], c=values[good], cmap=HEATMAP_CMAP, norm=norm,
+                        marker="H", linewidths=0)
         scatters.append(sc)
         self._colorbar = self.heat_fig.colorbar(sc, ax=ax, orientation="horizontal", shrink=0.9, aspect=30)
         self._colorbar.ax.tick_params(labelsize=8)
         if metric == "raw_phase":
             self._colorbar.set_ticks([-180, -90, 0, 90, 180])
-        ax.set_title(f"{self.metric_var.get()}\nat {freq:g} GHz", fontsize=9)
+        elif scale_note:
+            self._colorbar.set_ticks(_volt_ticks(vmin, vmax, norm))  # labelled in volts, spaced by the logistic scale
+        # The gap and the applied voltage don't depend on frequency, so no "at ... GHz" for them.
+        at = "" if metric in ("surface_gap", "applied_v") else f"\nat {freq:g} GHz"
+        ax.set_title(f"{self.metric_var.get()}{at}{scale_note}", fontsize=9)
         ax.set_xlabel("Stage X (mm)" if physical else "Column", fontsize=8)
         ax.set_ylabel("Stage Y (mm)" if physical else "Row (negated)", fontsize=8)
         ax.tick_params(labelsize=8)
@@ -375,6 +483,18 @@ class AnalysisTab(ttk.Frame):
         if ring is not None:
             ring.set_sizes([size * 2.2])
         self.heat_canvas.draw_idle()
+
+    def _logistic_params(self) -> tuple[float, float]:
+        """Midpoint and width (V) from the form; falls back to the defaults if they don't parse."""
+        try:
+            mid, width = float(self.logistic_mid_var.get()), float(self.logistic_width_var.get())
+            if width > 0:
+                return mid, width
+        except ValueError:
+            pass
+        self.logistic_mid_var.set(f"{LOGISTIC_MIDPOINT_V:g}")
+        self.logistic_width_var.set(f"{LOGISTIC_WIDTH_V:g}")
+        return LOGISTIC_MIDPOINT_V, LOGISTIC_WIDTH_V
 
     def _on_heat_freq_changed(self) -> None:
         self._draw_heatmap()
@@ -433,9 +553,10 @@ class AnalysisTab(ttk.Frame):
         _draw_vs_voltage(axes[0, 0], p, phase=True, ylabel=_phase_label(self.settings))
         _draw_vs_voltage(axes[0, 1], p, phase=False, ylabel="Magnitude (dB)")
         _draw_vs_frequency(axes[1, 0], p, p.phase_rel, _phase_label(self.settings), "Phase vs. frequency")
-        _draw_vs_frequency(axes[1, 1], p, p.gated_mag_db, "Gated magnitude (dB)", "Magnitude vs. frequency")
+        _draw_vs_frequency(axes[1, 1], p, p.gated_mag_db, _mag_label(p), "Magnitude vs. frequency")
         axes[1, 1].set_ylim(-50, 1)  # as the original script
-        fig.suptitle(f"{key[0]} element, row {key[1]}, column {key[2]}  ({el.file_name})", fontsize=10)
+        fig.suptitle(f"{key[0]} element, row {key[1]}, column {key[2]}  ({el.file_name}){_correction_note(p)}",
+                     fontsize=10)
         self.summary_canvas.draw_idle()
 
     def _show_raw(self, key, p, el, fig) -> None:
@@ -443,8 +564,9 @@ class AnalysisTab(ttk.Frame):
         vs frequency, with the heatmap frequency marked."""
         axes = fig.subplots(2, 1, sharex=True)
         freq = float(self.heat_freq_var.get()) if self.heat_freq_var.get() else None
-        for ax, data, ylabel, title in ((axes[0], p.phase_rel[0], "Phase, no reference (deg)", "Gated phase vs. frequency"),
-                                        (axes[1], p.gated_mag_db[0], "Gated magnitude (dB)", "Gated magnitude vs. frequency")):
+        how = "Calibrated" if p.correction == "surface_cal" else "Gated"
+        for ax, data, ylabel, title in ((axes[0], p.phase_rel[0], "Phase, no reference (deg)", f"{how} phase vs. frequency"),
+                                        (axes[1], p.gated_mag_db[0], _mag_label(p), f"{how} magnitude vs. frequency")):
             ax.plot(p.freqs_ghz, data, lw=1.0, color="#185FA5")
             if freq is not None:
                 ax.axvline(freq, color=SELECT_COLOR, lw=1, ls="--", label=f"Heatmap frequency ({freq:g} GHz)")
@@ -457,7 +579,8 @@ class AnalysisTab(ttk.Frame):
         axes[1].set_xlabel("Frequency (GHz)", fontsize=8)
         axes[1].set_xlim(p.freqs_ghz[0], p.freqs_ghz[-1])
         name = element_label(*key)
-        fig.suptitle(f"{name} (row {key[1]}, column {key[2]}) at {p.voltages[0]:g} V  ({el.file_name})", fontsize=10)
+        fig.suptitle(f"{name} (row {key[1]}, column {key[2]}) at {p.voltages[0]:g} V  ({el.file_name}){_correction_note(p)}",
+                     fontsize=10)
         self.summary_canvas.draw_idle()
 
     def _save(self, fig, kind: str) -> None:
@@ -492,6 +615,48 @@ def _spacing(xy: np.ndarray) -> float:
     d = np.hypot(sample[:, None, 0] - xy[None, :, 0], sample[:, None, 1] - xy[None, :, 1])
     d[d < 1e-9] = np.inf
     return float(np.median(d.min(axis=1)))
+
+
+def _logistic_norm(mid: float, width: float, vmin: float, vmax: float):
+    """Colour position = logistic(V): 1 / (1 + exp(-(V - mid) / width)), rescaled so the lowest
+    and highest voltages present are the two ends of the colour scale."""
+    def forward(v):
+        return 1.0 / (1.0 + np.exp(-(np.asarray(v, dtype=float) - mid) / width))
+
+    def inverse(y):
+        y = np.clip(np.asarray(y, dtype=float), 1e-12, 1 - 1e-12)
+        return mid + width * np.log(y / (1 - y))
+
+    return matplotlib.colors.FuncNorm((forward, inverse), vmin=vmin, vmax=vmax)
+
+
+def _volt_ticks(vmin: float, vmax: float, norm=None, min_gap: float = 0.07) -> list[float]:
+    """Whole-volt ticks across the range (or a handful of evenly spaced ones if that's too many).
+    With a logistic norm, ticks bunch up where the curve flattens, so any tick closer than
+    min_gap (fraction of the colour bar) to the previous kept one is dropped; ends are kept."""
+    ticks = np.arange(np.ceil(vmin), np.floor(vmax) + 1)
+    if not 2 <= len(ticks) <= 11:
+        ticks = np.linspace(vmin, vmax, 6)
+    if norm is None:
+        return [float(t) for t in ticks]
+    pos = np.asarray(norm(ticks), dtype=float)
+    kept = [0]
+    for i in range(1, len(ticks) - 1):
+        if pos[i] - pos[kept[-1]] >= min_gap and pos[-1] - pos[i] >= min_gap:
+            kept.append(i)
+    kept.append(len(ticks) - 1)
+    return [float(ticks[i]) for i in kept]
+
+
+def _mag_label(p) -> str:
+    return "Calibrated |gamma| (dB)" if p.correction == "surface_cal" else "Gated magnitude (dB)"
+
+
+def _correction_note(p) -> str:
+    if p.correction != "surface_cal":
+        return "\ntime-domain gated"
+    gap = f", gap {p.gap_mm:+.3f} mm" if p.gap_mm is not None else ""
+    return f"\nsurface-calibrated{gap}"
 
 
 def _phase_label(settings: AnalysisSettings) -> str:

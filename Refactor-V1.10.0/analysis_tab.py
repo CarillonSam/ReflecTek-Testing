@@ -32,7 +32,7 @@ from pattern import element_label
 
 SELECT_COLOR = "#E24B4A"
 MISSING_COLOR = "#D3D1C7"
-HEATMAP_CMAP = "nipy_spectral"   # every heatmap (voltage, phase, magnitude, gap) uses this one colour scheme
+HEATMAP_CMAP = "viridis"   # every heatmap (voltage, phase, magnitude, gap) uses this one colour scheme
 # Applied-voltage heatmaps use a logistic colour scale, matching the S-shaped (logistic) way an
 # element's phase responds to voltage, so equal colour steps are roughly equal steps along that
 # curve. Midpoint/width are editable under Processing options; these are only starting values.
@@ -123,6 +123,13 @@ class AnalysisTab(ttk.Frame):
                                             state="readonly", width=11)
         ref.pack(side="left", padx=4)
         ref.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
+        # Pattern runs: the machine origin is set for the tooling, independently of where pinout
+        # element E1_1 is, so the voltage map may need rotating 180 deg to match the board.
+        self.rotate_var = tk.BooleanVar(value=False)
+        self.rotate_check = ttk.Checkbutton(opts, text="Voltage map rotated 180\u00b0", variable=self.rotate_var,
+                                            command=self._on_rotate_changed, state="disabled")
+        self.rotate_check.pack(side="left", padx=(12, 0))
+        self._rotated: dict | None = None
         self.proc_button = ttk.Button(opts, text="Processing options", command=self._toggle_processing)
         self.proc_button.pack(side="right")
 
@@ -397,6 +404,8 @@ class AnalysisTab(ttk.Frame):
         if self.metric_var.get() not in metrics:
             self.metric_var.set(next(iter(metrics)))
         self.ref_combo.configure(state="disabled" if ds.scan_type == "pattern" else "readonly")
+        self._rotated = None  # recomputed for this run when needed
+        self.rotate_check.configure(state="normal" if ds.scan_type == "pattern" else "disabled")
         if new_dataset or self.selected not in processed:
             self.density_var.set(ds.densities[0])
             self.selected = min(k for k in processed if k[0] == ds.densities[0])
@@ -430,7 +439,11 @@ class AnalysisTab(ttk.Frame):
         keys, xy, physical = self._positions()
         metric = {**HEATMAP_METRICS, **RAW_HEATMAP_METRICS, **CAL_HEATMAP_METRICS}[self.metric_var.get()]
         freq = float(self.heat_freq_var.get())
-        values = np.array([analysis.heatmap_value(self.processed[k], metric, freq) for k in keys])
+        if metric == "applied_v" and self._rotation_on():
+            rotated = self._rotated_voltages()
+            values = np.array([rotated.get(k, np.nan) for k in keys])
+        else:
+            values = np.array([analysis.heatmap_value(self.processed[k], metric, freq) for k in keys])
         self._plot_keys, self._plot_xy = keys, xy
 
         _fit(self.heat_canvas)
@@ -495,6 +508,21 @@ class AnalysisTab(ttk.Frame):
         self.logistic_mid_var.set(f"{LOGISTIC_MIDPOINT_V:g}")
         self.logistic_width_var.set(f"{LOGISTIC_WIDTH_V:g}")
         return LOGISTIC_MIDPOINT_V, LOGISTIC_WIDTH_V
+
+    def _rotation_on(self) -> bool:
+        return bool(self.rotate_var.get()) and self.dataset is not None and self.dataset.scan_type == "pattern"
+
+    def _rotated_voltages(self) -> dict:
+        if self._rotated is None:
+            self._rotated = analysis.rotated_voltages(self.dataset)
+        return self._rotated
+
+    def _on_rotate_changed(self) -> None:
+        if self.dataset is None:
+            return
+        self._draw_heatmap()
+        if self.selected in self.processed:
+            self._show(self.selected)
 
     def _on_heat_freq_changed(self) -> None:
         self._draw_heatmap()
@@ -579,7 +607,15 @@ class AnalysisTab(ttk.Frame):
         axes[1].set_xlabel("Frequency (GHz)", fontsize=8)
         axes[1].set_xlim(p.freqs_ghz[0], p.freqs_ghz[-1])
         name = element_label(*key)
-        fig.suptitle(f"{name} (row {key[1]}, column {key[2]}) at {p.voltages[0]:g} V  ({el.file_name}){_correction_note(p)}",
+        applied = p.voltages[0]
+        if self._rotation_on():
+            applied = self._rotated_voltages().get(key, float("nan"))
+        volts = f"at {applied:.4f} V"
+        if self._rotation_on():
+            volts += " (voltage map rotated 180\u00b0)"
+        elif el.pattern_csv_v is not None and abs(el.pattern_csv_v - applied) > 1e-9:
+            volts += f" (CSV {el.pattern_csv_v:g} V)"
+        fig.suptitle(f"{name} (row {key[1]}, column {key[2]}) {volts}  ({el.file_name}){_correction_note(p)}",
                      fontsize=10)
         self.summary_canvas.draw_idle()
 

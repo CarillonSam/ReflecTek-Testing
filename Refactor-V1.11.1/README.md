@@ -1,884 +1,403 @@
-# Array Scan Project
+# Array Scan Project (Candice)
 
-**Version 1.13.2.** The Scan tab's plot shows a one-element border around the scan grid (each
-sub-grid N x M drawn as (N+2) x (M+2)), in amber, never scanned. 1.13.1 made the VNA Scan button
-send the scans' own trigger. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
-presets, data files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug
-fixes bump PATCH.
+**Version 1.11.1.** Version numbers follow MAJOR.MINOR.PATCH: a change that makes old presets, data
+files or calibrations invalid bumps MAJOR, a new feature bumps MINOR, and a bug fix bumps PATCH.
+
+Candice measures a reconfigurable RF array board: a GRBL XY stage moves a near-field probe over a
+hex grid of elements, a control board sets the elements' voltages, and a VNA records S11 at each
+position. It runs voltage sweeps and per-element voltage patterns, calibrates the stage and the
+board's surface warpage, and analyses the results.
+
+## Installing and running
+
+Python 3.10 or newer. On the lab PC (Windows), from Command Prompt:
+
+```
+python -m pip install --upgrade pip
+python -m pip install numpy scipy matplotlib pyserial pyvisa pyvisa-py paramiko openpyxl
+python -c "import numpy, scipy, matplotlib, serial, pyvisa, pyvisa_py, paramiko, openpyxl, tkinter; print('all good')"
+python gui_app.py
+```
+
+tkinter comes with the python.org installer ("tcl/tk and IDLE" ticked), not from pip. If more than
+one Python is installed, use `py -m pip ...` and `py gui_app.py` so both use the same one. NI-VISA is
+optional: only needed if `vna.visa_backend` is cleared to use it instead of `pyvisa-py`.
 
 ## Files
 
-- `config.py` — all experiment settings (dataclasses)
-- `stage.py` — motor stage handler (`MotorStage` interface + `GrblXY` implementation),
-  the scan geometry it moves through (`HexGridPlanner`), and stage calibration (`StageCalibration`)
-- `calibrate_stage.py` — one-time interactive calibration utility (run standalone, not part of a scan)
-- `controller.py` — `BoardController` interface, plus small helpers shared by controllers
-- `pixel_controller.py` — `PixelController`: the framed-serial-protocol board controller
-- `pi_controller.py` — `PiBoardController`: SSH/file-upload board controller for the
-  Raspberry Pi + SPI DAC setup (wraps `PiController`, the paramiko transport layer)
-- `vna.py` — VNA handler: `VNAInstrument` interface + `VNAController`, the concrete
-  VISA/SCPI driver for the lab's VNA (this used to be the separate `VNATest.py`)
-- `data.py` — data handler: `DataSaver`
-- `run_scan.py` — coordinator (`AutomatedArrayScanner`) that wires the four handlers
-  together and runs the scan; also has the example run config in `__main__`
-- `pinout.py` — reads each element's controller index straight from `pinout_32x32.xlsx` (needs
-  `openpyxl`), checked against `Pixel_Map_by_ConnRow.csv`; see "Element addressing" below
-- `pinout_32x32.xlsx` — the board pinout: element names, pins and MUX words
-- `Pixel_Map_by_ConnRow.csv` — the controller's wiring table (index, connector, pin, MUX word, DAC select)
-- `config_io.py` — RunConfig <-> JSON (for saving/loading GUI presets)
-- `branding.py` — app name ("Candice") and the kiss-mark logo loader
-- `kiss_mark.png` — the logo image (40x35, transparent background)
-- `settings_tab.py` — GUI tab 1: Settings & Configuration (`SettingsTab`)
-- `scan_tab.py` — GUI tab 2: Scan (`ScanTab`) — live geometry preview, progress bar, Start/Stop
-- `pattern.py` — reads voltage pattern CSVs (one voltage per element, by pinout name, list or grid)
-- `calibration_wizard.py` — the calibration walkthrough window (stage + surface calibration)
-- `surface_cal.py` — surface calibration sets: site layout, plate files, solving with `nfp_calibrate.py`, applying
-- `nfp_calibrate.py` — the copper-plate calibration script, unchanged; the app imports its functions
-- `analysis.py` — dataset loading, time gating and phase/magnitude processing for the Analysis tab (adapted from `ElementToElementPTV.py`; no GUI code)
-- `analysis_tab.py` — GUI tab 4: Analysis (`AnalysisTab`) — board heatmap and per-element 2x2 plots
-- `gui_app.py` — GUI entry point; run this directly (`python gui_app.py`)
+| File | What it is |
+| --- | --- |
+| `gui_app.py` | Entry point: `python gui_app.py` opens the app (three tabs: Settings, Scan, Analysis) |
+| `settings_tab.py` | Settings tab (General and Advanced settings, presets, Calibrate...) |
+| `scan_tab.py` | Scan tab: plot, Start/Cancel, and the manual-control side panel |
+| `analysis_tab.py`, `analysis.py` | Analysis tab (widgets) and its processing (no GUI code) |
+| `calibration_wizard.py` | The calibration walkthrough window |
+| `surface_cal.py` | Surface calibration sets: site layout, plate files, solving, applying |
+| `nfp_calibrate.py` | The copper-plate calibration script, unchanged; the app imports its functions |
+| `config.py` | Every setting, as dataclasses; `config_io.py` reads and writes them as JSON presets |
+| `run_scan.py` | `AutomatedArrayScanner`: runs a scan (also runnable on its own, see below) |
+| `stage.py` | `GrblXY` stage driver, `HexGridPlanner` (scan geometry), `StageCalibration` |
+| `calibrate_stage.py` | Stage-only calibration maths, and a minimal standalone calibration script |
+| `controller.py` | `BoardController` interface shared by the two board controllers |
+| `pixel_controller.py` | `PixelController`: the serial-protocol control board |
+| `pi_controller.py` | `PiBoardController`: the Raspberry Pi + SPI DAC board, over SSH |
+| `pinout.py`, `pinout_32x32.xlsx` | Element addressing, read straight from the board pinout |
+| `Pixel_Map_by_ConnRow.csv` | The controller's wiring table, used to check the pinout |
+| `pattern.py` | Reads voltage-pattern CSV files |
+| `vna.py` | `VNAController`: VISA/SCPI driver for the VNA |
+| `data.py` | `DataSaver`: one file per measured element, plus run metadata |
+| `branding.py`, `kiss_mark.png` | App name and logo |
 
-## Adding a new controller, stage, or VNA
+## Settings tab
 
-`stage.py`, `controller.py`, and `vna.py` each define a small interface (`MotorStage`,
-`BoardController`, `VNAInstrument`) that the real hardware classes implement:
+**General settings** are what changes from run to run:
 
-```python
-class BoardController(ABC):
-    def ping(self) -> dict: ...
-    def set_voltage_grid(self, voltages: np.ndarray) -> None: ...  # voltages[col, row]
-    def close(self) -> None: ...
-```
+| Setting | Notes |
+| --- | --- |
+| Board controller | `pixel` (serial control board) or `pi` (Raspberry Pi) |
+| RF band | Low band (17-21 GHz) or high band (26-30 GHz). Choosing one loads that band's VNA sweep (4001 points) into Advanced > VNA; a grey line shows the sweep that will run. Loading a preset keeps the preset's own sweep. |
+| Scan type | Voltage sweep, or Voltage pattern (CSV) (see "Scans") |
+| Voltages (V) / Pattern CSV | Comma-separated voltages for a sweep, or the pattern file. A grey line says what was read from the file, or in red why it can't be used. |
+| Settle time (s) | Wait after setting voltages, before measuring (default 45 s) |
+| Rows / Columns (per sub-grid) | 32 x 32 gives 3072 elements (see "Geometry") |
+| Full-grid spacing (mm) | Nearest-neighbour distance between elements (default 4 mm) |
+| Density to scan | L or H |
+| L sub-grid | Which row the board's L elements start on (1 = the board's first row is L) |
+| Mirror stagger direction | Which side the offset rows overhang |
+| Output directory, Run name | Data goes in output directory / run name |
+| Stage calibration file | The stage calibration (`.json`); blank = uncalibrated |
+| Surface calibration folder | Where surface calibrations are saved; blank = next to the stage calibration file |
 
-`run_scan.py` never touches per-pixel addressing at all — it builds a `(cols, rows)`
-numpy array of the voltage each grid element should get and hands the whole thing to
-`set_voltage_grid`. Translating a grid position into physical hardware addressing
-(serial index, band+channel, whatever) is entirely the controller's job.
+**Advanced settings** (Show advanced settings) list every other field in `config.py` under its real
+name (`stage.port`, `vna.start_hz`, `pixels.addressing`...), generated from the config dataclasses, so
+a new field appears automatically. Fields with fixed choices are dropdowns. Only the selected
+controller's group (`pixels.*` or `pi.*`) is shown.
 
-For `BoardController`, `RunConfig.controller_type` picks which implementation
-`AutomatedArrayScanner.connect()` constructs — `"pixel"` (default, `PixelController`)
-or `"pi"` (`PiBoardController`). Nothing else in `run_scan.py` needs to change, since it
-only calls methods on the interface.
-
-## Using the Pi controller
-
-Set `controller_type="pi"` and fill in `RunConfig.pi` (a `PiControllerConfig`) with your
-SSH host/credentials and file paths. **No PC-side element mapping at all** — the Pi has
-its own internal element-to-DAC map, so `set_voltage_grid`'s array is uploaded directly:
-`csv[row][col]` in the uploaded file is the voltage for the element at that position,
-full stop. Concretely, `voltages` (shape `(cols, rows)`, this project's convention) gets
-transposed to `(rows, cols)` and written as one line per row, comma-separated columns —
-verified directly against a worked example (a 3x3 grid, checked cell by cell) before
-this was wired in.
-
-`PiControllerConfig.active_band` ("lb" or "hb") picks which file gets that real,
-scan-derived grid — the *other* band's file is still uploaded (some remote scripts
-expect both present) filled with zeros, sized by its own `hb_shape`/`lb_shape`
-(`(rows, cols)`, independent of the active band's shape, since the two bands can be
-physically different sizes). **`hb_shape`/`lb_shape` are placeholder values (`(24, 8)`)
-and need real numbers before trusting this.**
-
-**Naming collision worth being careful about:** this project's `ScanGeometryConfig.density_mode`
-uses `"L"`/`"H"` for a completely different concept (low/high density — which of the 3
-interleaved sub-lattices is being scanned), while `PiControllerConfig.active_band` uses
-`"lb"`/`"hb"` for RF frequency band. They're unrelated axes that happen to share letters —
-a low-density (`density_mode="L"`) scan could target either the low-band or high-band RF
-path (`active_band="lb"` or `"hb"`), and vice versa. Flagging this now since it's an easy
-mix-up, not renaming anything without being asked.
-
-**Because this controller pushes over SSH and restarts a remote process on every write**,
-it's inherently slower than the serial controller — there's no more "uniform grid" fast
-path to skip work, either, since every `set_voltage_grid` call now does the exact same
-amount of work (write 2 files, one push) regardless of whether the grid is uniform or not.
-
-## GUI
-
-`python gui_app.py` opens **Candice**, a four-tab window (Settings, Scan, Debug, Analysis) (needs tkinter, which ships with
-standard Python installs on Windows) with a lipstick-kiss logo in the header
-(`kiss_mark.png`, loaded via `branding.load_kiss_mark_image()`). This is a real desktop
-app, not a web page — it needs direct access to COM ports, local files, and SSH, none of
-which a browser page could reach, so tkinter (stdlib, matches what your existing scripts
-already use) is the natural fit here.
-
-What the GUI covers end to end:
-- **Change experiment-specific settings** — Settings tab (General, plus Advanced for everything else).
-- **View experiment progress and the points to be scanned** — Scan tab (live matplotlib
-  preview, progress bar + voltage label, current-position box).
-- **Calibrate the stage for the particular DUT** — Settings tab, **Calibrate...** button.
-- **Begin a scan** — Scan tab's **Start Scan** button (and **Stop Scan** to cancel one
-  cleanly mid-run).
-- **Manual hardware control** — the side panel on the Scan tab (see "Manual controls" below).
-
-**Settings & Configuration tab** (`settings_tab.py`, `SettingsTab`), reorganised in V1.4.5 into two parts.
-
-*General settings* holds what an operator changes run to run:
-- Board controller (`pixel` / `pi`)
-- RF band: low band (17-21 GHz) or high band (26-30 GHz). Choosing a band loads that band's default
-  VNA sweep (`config.BAND_VNA_DEFAULTS`: LB 17-21 GHz, HB 26-30 GHz, 4001 points each) into the
-  Advanced VNA fields, and a grey line under the selector shows the sweep that will actually run.
-  Loading a preset does *not* apply band defaults, so a preset's own sweep is kept exactly as saved.
-- Voltages (comma-separated) and settle time (`uniform_board_settle_s`, default 45 s)
-- Grid size (rows and columns per sub-grid), full-grid spacing, density to scan, L sub-grid, and
-  mirror stagger direction
-- File paths (moved here in V1.4.6): output directory and run name (`save.output_dir`,
-  `save.run_name`; data lands in output directory / run name), stage calibration file
-  (`stage.calibration_file`). The Pi controller's `pi.local_file_*`/`remote_file_*`
-  paths stay under Advanced, since they're fixed wiring for the Pi setup rather than per-run files.
-
-*Advanced settings* (collapsed by default; **Show advanced settings**) holds every other field in
-`config.py`, each labelled with its real variable name (`stage.port`, `vna.start_hz`,
-`geometry.x_direction_sign`, ...) and a grey hint for its type. It's generated from the config
-dataclasses themselves, so a field added to `config.py` appears here automatically (and an
-annotation type the tab doesn't know how to edit fails loudly at startup, rather than silently
-vanishing). Only the selected controller's group (`pixels.*` or `pi.*`) is shown. The one field not
-shown is `pi.active_band`, which is always derived from the RF band (`RunConfig.band`, synced in
-`RunConfig.__post_init__`), so there's one source of truth for band.
-
-This replaces the old design where hardware/connection fields were hidden and only settable through
-`config.py` or a preset. They're still tucked away under Advanced, but editable.
-
-Buttons at the bottom: **Validate Settings**, **Save Settings... / Load Settings...** (JSON presets via
-`config_io.py`, now including every field), **Reset to Defaults**, and **Calibrate...** (uses the stage
-calibration file from General and the stage settings under Advanced).
-
-Validation collects every problem in the form at once and shows them together, using the General
-labels or the variable name. `get_config()` requires `save.output_dir` and `save.run_name`;
-`get_config(require_save=False)` skips just those two checks, which is what the Scan tab's manual controls and stage
-calibration use so a blank run name can't block a manual jog.
-
-Presets from older versions still load: missing fields fall back to their defaults, and a preset with
-no `band` takes it from `pi.active_band`. (The V1.4.4 note about spacing meaning still applies to
-presets older than that.) Saving a preset with a mapping CSV path set used to crash with
-`TypeError: PosixPath is not JSON serializable`; fixed.
-
-Verified with real tkinter under a virtual display (not a fake this time): defaults and a set of
-custom values in every section round-trip through every widget exactly, the band switch loads the
-right sweep and syncs `pi.active_band`, validation reports all problems together, the live preview
-hook fires for geometry fields in both sections, presets save and reload, and a dry-run scan started
-from the Scan tab's Start button runs to 100%.
+**Buttons:** Validate Settings (lists every problem at once), Save Settings / Load Settings (JSON
+presets with every field), Reset to Defaults, and Calibrate... (the calibration walkthrough).
+Presets saved by older versions still load; missing fields take their defaults and unknown ones are
+ignored.
 
 ## Scan tab
 
-`scan_tab.py`, `ScanTab`. A matplotlib scatter of every active point (`stage_x_mm`,
-`stage_y_mm`), a progress bar, and Start Scan / Stop Scan buttons.
+**The plot** shows the whole grid in plot coordinates (stage X/Y, mm, before the stage calibration
+is applied):
+- the density being scanned in **blue**, turning **green** as each element is measured;
+- the other density in **grey** (never scanned);
+- a **border** of one extra row and column of every sub-grid on each side, in **amber**, never
+  scanned (with 32 x 32 sub-grids: L drawn 34 x 34, H 68 x 34, 3468 positions in all), so the
+  origin has elements above and beside it;
+- the **safe area** as a dashed red outline (see below);
+- a small **red box** where the stage is, following scans and manual moves.
 
-**Live geometry preview.** The plot rebuilds from `SettingsTab.get_geometry_or_none()`
-(a non-raising variant of the geometry portion of `get_config()` — returns `None` on
-invalid/incomplete input instead of erroring, so a half-typed number doesn't break
-anything). It's called two ways: `SettingsTab.on_geometry_change` fires on every
-`<KeyRelease>` in the four geometry fields (rows, cols, spacing, row spacing override),
-and switching to the Scan tab calls it again via `<<NotebookTabChanged>>` — that second
-path is what catches Load Settings / Reset to Defaults, which change many fields at once
-without firing individual key events.
+**Start Scan** validates the settings and runs the scan in the background, with a progress bar and
+the current voltage (or, for a pattern scan, the current element and its voltage). **Cancel Scan**
+finishes the current point and stops cleanly; data measured so far is kept.
 
-**Running a scan.** Start Scan calls `SettingsTab.get_config()` (full validation, same as
-the Settings tab's own Validate button) and, if valid, launches `AutomatedArrayScanner` in
-a background thread — a real scan blocks on serial/SSH/VISA I/O, so it can't run on the
-GUI thread without freezing the window. The scanner now takes two optional callbacks:
+### Side panel
 
-```python
-AutomatedArrayScanner(config, on_progress=callback, cancel_event=threading.Event())
-```
-
-`on_progress(event: ProgressEvent)` fires after every point is measured, where
-`ProgressEvent` bundles `step`, `total_steps`, `point`, `voltage_index`, `voltage_count`,
-and `voltage_v` — `run()` computes `total_steps = voltage_count * point_count` up front, so
-`event.step / event.total_steps` is a direct progress fraction over the *whole* run, and
-the voltage fields are what drives the "Voltage 2/5: 1.000 V" label next to the progress
-bar. `cancel_event` is checked before each point; if set, the scan stops cleanly after the
-point in progress (hardware still gets homed/closed via the usual `finally: self.close()`)
-and skips writing the final summary `.npz` (per-point files already written up to that
-point are kept).
-
-Because `on_progress` runs on the worker thread, `ScanTab` never touches widgets or the
-plot from inside it — it only pushes onto a `queue.Queue`, which the GUI thread drains via
-`self.after(100, self._poll_queue)`. That's the standard, correct pattern for tkinter:
-direct cross-thread widget mutation isn't safe. Each drained progress message updates the
-progress bar and recolors that point's marker via `scatter.set_facecolor(...)`.
-
-**Three colors, not two.** The plot always shows the *whole* dense lattice (both L and H —
-`HexGridPlanner.all_points()`), not just what's being scanned. Whichever density
-`ScanGeometryConfig.density_mode` selects starts **blue**, then turns **green** the first
-time each point is measured (later voltage steps revisiting it are idempotent — it
-doesn't turn "more green"). The *other* density is **grey** from the start and never
-changes, since it's never scanned at all — `on_progress` only ever fires for active
-points, so inactive ones simply never receive an event to react to. Switching
-`density_mode` (or `l_subgrid`) in Settings immediately swaps which set is blue/green vs
-grey, live, via the same geometry-change hook everything else in this tab already uses.
-
-A small red box (`matplotlib.patches.Rectangle`) also moves to each measured point's
-position — a "the stage is currently here" indicator, distinct from the blue/green/grey
-history dots. It's sized relative to that run's point spacing (`0.6 × spacing_mm`) so it
-stays legible on coarse or fine grids, and it tracks in the same ideal/planned coordinate
-space as the rest of the plot (not the post-calibration physical position), consistent with
-everything else drawn there. It only appears once a scan is actually running — starting a
-new scan or editing geometry (which redraws the whole plot) clears it until the next
-progress update places it again.
-
-I verified all of this except the actual widget rendering, which needs a real display:
-the progress-callback math and cooperative cancellation directly against `run_scan.py`
-(exact step/total counts, and that cancelling mid-run skips the summary but keeps
-per-point data already collected); the matplotlib scatter-and-recolor calls directly
-against a real (non-Tk) `Figure`/`Axes`, confirming `set_facecolor` correctly updates
-only the intended point; and the full GUI wiring — app construction, live geometry
-linking, tab-switch refresh, and a complete scan from Start through 100% through Stop —
-by extending the same fake-tkinter harness from before with a stub for matplotlib's
-Tk-specific canvas (the real `Figure`/`Axes` still does the actual plotting inside it) and
-actually running the real background thread to completion.
-
-## Voltage pattern scans (V1.6.0)
-
-Settings > General > **Scan type: Voltage pattern (CSV)** sets each element to its own voltage from
-a CSV, once, then measures every element of the scanned density (L or H) a single time. There is no
-voltage sweep and no reference: each element's file holds one raw measurement.
-
-**Element names** are the pinout's, 1-indexed: L elements are `E1_1` .. `E32_32`, H elements are
-`H1_1` .. `H64_32` (`L1_1` and `H_1_1` spellings also work). `H1_1` is H row 0, column 0 in the
-0-indexed numbering used by file names and the Analysis tab.
-
-**CSV layouts** (`pattern.py`):
-- **Labelled:** rows of `element name, voltage`, e.g. `H1_1, 2.5`. May mix E and H elements. Any
-  element left out is set to 0 V.
-- **One column (or one row):** one voltage per element of the scanned density, row by row: the first
-  value goes to H1_1, then H1_2 .. H1_32, H2_1, and so on (2048 values for H, 1024 for L).
-- **Grid:** rows x columns of the scanned density (64 x 32 for H, 32 x 32 for L); CSV row r,
-  column c is element row r, column c.
-
-Header lines are skipped. The grey line under the field says what was read (e.g. "2048 H values, 0
-to 7.5 V (by element name)") or, in red, why the file can't be used (wrong count, a voltage outside
-the controller's range, a duplicate or unknown name). Validate and Start refuse an unusable file
-before any hardware moves.
-
-**Hardware:** with the pixel controller, every output is first set to 0 V, then each element in the
-pattern is set by its index from the pinout (see "Element addressing" below), so nothing needs
-selecting. Elements of the other density not in the file stay at 0 V.
-The Pi controller takes one grid for the scanned density only, so a pattern that sets the other
-density's elements to anything but 0 V is refused. After programming, the scan waits the settle time.
-
-**Saved data:** one file per element as usual, with one measurement (`sdata` shape (1, N)), plus
-`scan_type = "pattern"` and `element` (its pinout name). **`e` is the voltage actually applied to that
-element (V1.9.1), not the CSV value:** the pixel controller records the last 12-bit code it sent to
-every output, as each batch is acknowledged, and each element's voltage is that code converted back
-to volts (through its pinout index). So it includes the DAC's resolution (steps of 10 V / 4095 =
-2.44 mV, so up to 1.2 mV from the CSV number), elements the CSV leaves out (0 V), and anything set
-by the uniform pass first. A batch the controller refuses isn't recorded. With the Pi controller,
-it's the value written to the Pi's grid file (clipped to the range, 4 decimals). The CSV's own value
-is kept alongside as `pattern_csv_v`. Dry runs go through the same controller code with the serial
-link stubbed out, so they record the same thing hardware would. No controller here can read
-voltages back, so this is the commanded output, not a measurement at the element. The run folder
-also gets `voltage_pattern_source.csv` (the file as given) and `voltage_pattern_applied.csv` (all
-3072 elements: name, row, column, controller output, applied voltage and CSV voltage), and
-`metadata.json` records `scan_mode: "voltage_pattern"`.
-
-**Analysis:** the Analysis tab recognises a pattern run. Each element is time-gated with the same
-gate settings as sweep runs (Processing options), but nothing is subtracted: no linear trend, no
-first-voltage reference. The heatmap offers **Phase, no reference** (the gated phase, -180 to 180
-deg, drawn with a cyclic colour scale since -180 and +180 are the same phase), **Gated magnitude**,
-and **Applied voltage** (the voltage actually sent to each element, to check the pattern went where
-intended; the element view shows the CSV value too when they differ).
-
-**Voltage map rotated 180 deg (V1.9.2).** The machine origin is set for the tooling, independently
-of where pinout element E1_1 is on the board, so the software can't know which way round the
-element numbering runs relative to the stage: positions come from the scan planner, voltages from
-the pinout, and nothing ties the two together. If the voltage map comes out rotated 180 deg from
-the board, tick **Voltage map rotated 180 deg** (pattern runs only). Each element then shows, on the
-map and in the element view, the voltage that reached its position if the numbering is rotated:
-the applied voltage of the element at the position mirrored through the board's centre. That uses
-the run's `voltage_pattern_applied.csv` (all 3072 elements), since a mirrored position can belong to
-the other density (with L sub-grid 1 or 3, half the H positions mirror onto L elements; with L
-sub-grid 2 the rotation keeps each density and is simply row, column -> last row - row, last column
-- column). Runs without that file fall back to the scanned elements. This is display only: how the
-CSV is sent to the board, and what's saved, are unchanged. Selecting an element
-shows its gated phase and magnitude vs frequency with the heatmap frequency marked. The phase
-reference option is greyed out.
-
-Verified: pattern files built from the real pinout labels load in all three layouts, and bad files
-are rejected with the reasons above; addressed from the pinout, all 3072 controller
-outputs end at exactly their element's voltage; a pattern scan run from the GUI completes and saves
-the files above; and on a synthetic pattern run with a known phase for every element plus a late reflection,
-the gated-phase heatmap recovers each element's direct-path phase (the reflection gated out) and
-the applied-voltage heatmap matches the pattern exactly.
-
-## Element addressing: straight from the pinout (V1.6.3)
-
-The pixel controller's protocol sets an element by index (`CMD_SET_BY_INDEX`); the firmware turns
-the index into the MUX/DAC address. `pinout.py` reads every element's index straight from
-`pinout_32x32.xlsx` (sheet "PINOUT CONTROLLER"): an element's index is its position when the sheet
-is read block by block (8 column blocks, 5 row bands each, odd- and even-pin columns top to bottom,
-GND pins skipped). There is no separate mapping file and nothing to select: the pinout is the only
-source. A different board's pinout can be used by setting `pixels.pinout_file` under Advanced.
-
-Every time the pinout is loaded (once per connection, about half a second) it is checked against
-`Pixel_Map_by_ConnRow.csv`, the controller's wiring table: the MUX word at each index must match.
-A MUX word alone isn't unique (each is shared by six elements on different DAC selects); the index
-is. A mismatch stops the scan before anything is sent, which catches a different board's
-spreadsheet, a missing or extra pin, rows out of order, or an edited MUX word (all tested on
-altered copies). It can't catch two element names swapped while their pins stay put, since the
-wiring table has no element names to compare against; the pinout's names are trusted as written.
-
-`python pinout.py` prints a summary; `python pinout.py --export table.csv` writes one row per
-element (name, index, MUX word, connector, pin) for reference. That the firmware's index order
-matches the wiring table is still worth one bench check: set a single element and confirm it's the
-expected one.
-
-1.6.2 shipped `pixel_mapping_L.csv`/`pixel_mapping_H.csv` generated from the pinout; earlier versions
-required selecting those files by hand. Both are gone, along with `build_pixel_mapping.py`,
-`merge_mapping_workspace.py` and `mapping_template_32x32.csv`. Presets that still name mapping files
-load fine; those entries are ignored.
-
-## Analysis tab
-
-`analysis_tab.py` (widgets and drawing) and `analysis.py` (processing), adapted from
-`ElementToElementPTV.py`.
-
-1. **Dataset folder:** type or browse to a run folder and click **Load** (or press Enter). The box
-   starts with the current run's folder (output directory / run name from Settings). Loading and
-   processing run in the background with a progress bar: about 7 s for an L dataset and 14 s for H.
-   The line under the folder shows what was found, e.g. "1024 L elements, 6 voltages, 17-21 GHz".
-2. **Heatmap:** every element at its physical position, coloured by phase range across voltage,
-   phase at the last voltage (what the original script plotted), or magnitude range, at one of the
-   reference frequencies. Elements without enough measured voltages show grey.
-3. **Element plots:** click an element on the heatmap, or enter its row and column (0-indexed, as
-   in the file names; plus L/H if the folder has both) and press **Show**. The right side shows the
-   original script's 2x2 figure: phase and magnitude vs voltage at each reference frequency, and vs
-   frequency for each voltage. Each plot's legend sits outside it, to the right; when a plot has more
-than 10 lines (more than 10 reference frequencies, or more than 10 voltages), the lines are coloured
-by their actual value and a colour bar replaces the legend. **Save heatmap...** and **Save plot...**
-write PNG or PDF.
-4. **Processing options** (collapsed): reference frequencies, gate width (samples before/after the
-   time-domain peak) and Tukey alpha, then **Reprocess**. **Phase reference** (linear trend or first
-   voltage) reprocesses immediately.
-
-Differences from the original script: it works from the files' complex `sdata` (no magnitude/phase
-round trip); it uses each file's own frequency axis (16-24 GHz is only assumed for legacy files that
-don't record one); elements are keyed by density as well as row/column, since L and H row numbers
-overlap; only measured voltages are used, so a cancelled scan still loads; reference frequencies
-default per band (18-20 GHz for low band, 27-29 GHz for high band, 0.25 GHz apart; the original
-list's "19.75 GHz" and "20.0 GHz" entries both pointed at 19.5 GHz); and gating isn't rounded
-mid-calculation. Legacy files (`amplitudes`/`phases` keys, `C#R#` names) still load.
-
-Verified against the original script's own functions on the same element (phase within 0.001 deg,
-magnitude within 0.0001 dB, the difference being the original's rounding), and on synthetic
-datasets with a known phase shift per element plus a reflection the gate must remove: the heatmap
-recovers every element's phase range to 0.0003 deg. Tested end to end with real tkinter: L and H
-datasets, high band, a cancelled scan, legacy files, clicking and typed selection, invalid input,
-reprocessing, and saving.
-
-Figures are re-fitted to their widget's pixel size before each draw. Matplotlib can raise a figure's
-DPI after the window appears (to match display scaling), keeping its size in inches, which renders
-it wider than its widget and clips the right edge; this showed up as clipped plots during testing.
-
-### Heatmap colours (V1.7.1)
-
-Every heatmap (applied voltage, phase, magnitude, surface gap) uses the same colour scheme
-(viridis), so maps can be compared side by side. Phase heatmaps always span -180 to 180 deg.
-
-**Applied voltage** uses a logistic colour scale, matching the S-shaped way an element's phase
-responds to voltage: a voltage's position on the colour scale is 1 / (1 + exp(-(V - midpoint) /
-width)), rescaled so the lowest and highest voltages present are the two ends. Equal colour steps
-are then roughly equal steps along the response curve rather than equal volts, which linearizes the
-view. The colour bar stays labelled in volts (unevenly spaced, following the curve; labels that
-would crowd together are dropped) and the title states the midpoint and width. Both are set under
-Processing options ("Voltage colour scale"); 5 V and 1.5 V are only starting values, so set them
-from the device's measured curve. Changing them redraws the heatmap without reprocessing.
-
-### Correction: time gate or surface calibration (V1.7.0)
-
-The **Correction** row under the dataset folder chooses how each element's response is cleaned up:
-
-- **Time-domain gate** (default): as before, using the gate settings under Processing options.
-- **Surface calibration**: uses the output folder of the copper-plate surface calibration script
-  (`nfp_calibrate.py`, kept separate from the app). Point **Calibration folder** at its `--out-dir`
-  and run that script with the run folder as its `--data-dir`. The script writes one
-  `<element>_cal.npz` per element: a copy of the element file plus `gamma` (the corrected
-  reflection, with the probe's error terms removed and each element moved to its own fitted
-  surface height) and `gap_mm` (the warp at that element). The tab matches each element of the
-  loaded run to its file and uses `gamma` in place of gating; the gate settings are greyed out.
-
-The phase reference (linear trend or first voltage) still applies on top, since it describes the
-voltage behaviour, not the correction; pattern runs still subtract nothing. Switching correction
-reprocesses the already-loaded run without reading it from disk again. With surface calibration,
-the heatmap also offers **Surface gap (mm)**: the warp map the calibration fitted, relative to its
-reference site (positive = closer to the probe). Plot titles and labels say which correction is
-in use.
-
-Checks: a calibration file must come from the same run (same voltages, and frequencies that are
-the run's own points); files that don't match are left out and counted, and if none match the tab
-says why. Elements with no calibration file are left out and counted. If the script was run with
-`--band`, gamma is NaN outside the band and those frequencies are dropped.
-
-Verified on a synthetic warped array with known truth (bowl-shaped warp plus tilt, about 0.7 mm
-across the board; frequency-dependent probe leakage, multiple reflections and transmission; copper
-plates at 0, 1, 2 mm measured at 9 sites), running the calibration script unchanged to produce the
-folder: every element's phase vs voltage is recovered exactly (1e-12 deg), the magnitude matches
-the true value, and the surface gap heatmap matches the true warp to within 1 um (the script's fit
-resolution is 2 um). Time gating on the same data is off by up to 16 deg, because the probe's
-multiple reflections arrive too close in time to the element's response to gate out. Also tested:
-a `--band 18 20` calibration, a partial calibration folder, a calibration folder from a different
-run, a folder that isn't calibration output, and a voltage pattern run.
-
-## Manual controls on the Scan tab (V1.11.0)
-
-The Debug tab has been folded into a side panel on the Scan tab, next to the plot. The Scan tab's
-own buttons are **Start Scan** and **Cancel Scan** (renamed from "Stop Scan" so it can't be
-confused with the emergency STOP; it still finishes the current point and stops cleanly).
-
-**Border elements on the plot (V1.13.2).** Around the scan grid the plot draws one more row and
-column of every sub-grid on each side, in light amber: with 32 x 32 sub-grids, L is drawn 34 x 34
-and H 68 x 34, 3468 positions in all (3072 scan points + 396 border). The origin (the first L
-element) therefore has elements above and beside it. They come from
-`HexGridPlanner.border_points()`, the same position formula as the scan points, so they continue the
-lattice exactly (every position 4 mm from its neighbours at 4 mm spacing). They're display only:
-never scanned, not saved, and not part of the safe area, which is still 1 cm around the scan points.
-The title shows the count, e.g. "1024/3072 points (L active) + 396 border".
-
-**Motor controls.** All positions are in the plot's coordinates (mm), with the stage calibration
-applied, so the probe lands where the plot says:
-- **Go to X** / **Go to Y**: move that axis to a position; the other axis stays where it is.
+**Motor controls.** Positions are in plot coordinates (mm), with the stage calibration applied, so
+the probe lands where the plot says.
+- **Go to X** / **Go to Y**: move that axis to a position; the other stays where it is.
 - **Move X by** / **Move Y by**: move that axis by an amount from where the stage is now.
-- **Position** shows where the stage reports it is (read back from GRBL and converted to plot
-  coordinates), updated after every move; **Read** reads it on demand. The red box on the plot
-  follows it.
-Each Go waits until the stage has arrived; the controls are greyed out while a move, a scan, or a
-calibration is running. The panel connects to the stage on first use and keeps the connection
-open between moves; it's released automatically when a scan or calibration starts (they open
-their own) and when the app closes. (Moves use the stage's own move timeout and tolerance, like
-scans.)
+- **Position** is where the stage reports it is (read back from GRBL); **Read** reads it again.
 
-**STOP** (the big red button, always enabled) stops the stage at once with GRBL's soft reset
-(Ctrl-X, 0x18): a real-time command GRBL acts on immediately, ahead of anything queued. It is
-written straight to the serial line, so it works even while a move or a scan is waiting on the
-stage. It goes to every stage connection the program has open (a running scan's and/or the
-panel's); if none is open, it opens the stage port just to send the reset. It also cancels any
-running scan. Because a reset during motion means GRBL can no longer vouch for its position, every
-motion control, Start Scan and Calibrate are then locked, and a pop-up says what to do:
+Each Go waits until the stage arrives. The panel's controls are greyed out while a move, a scan or a
+calibration is running. The panel's connections (stage, board, VNA) stay open between uses and are
+released automatically when a scan or calibration starts, and when the app closes.
+
+**Safe area.** The box around every point a scan could visit (both densities), plus a 10 mm margin
+(`SAFE_MARGIN_MM` at the top of `scan_tab.py`). With the default geometry: X -228.2 to +10,
+Y -200 to +10. Before every Go, the panel reads the stage position and works out the exact target;
+if it's outside the safe area, a dialog shows the target, the limits and how far past them it is,
+with **Confirm move** and **Cancel**. Cancel is the default (Enter and Escape cancel too) and leaves
+the stage exactly where it is. Scans don't use this check (every scan point is inside by
+definition), and it isn't sent to GRBL; it only guards the panel's manual moves.
+
+**STOP** (big red button, always enabled) sends GRBL's soft reset (Ctrl-X, 0x18) straight down the
+serial line, so the stage stops at once, even mid-move or mid-scan. It reaches every stage
+connection the app has open; if none is open, it opens the stage port just to send it. It also
+cancels any running scan. Because GRBL can't vouch for its position after a reset during motion,
+every motion control, Start Scan and Calibrate are then locked, and a pop-up says:
 1. Cut power to the motors.
 2. Move the motors back to the origin by hand.
 3. Close and restart this software.
 4. Restore power to the motors.
-If the reset couldn't be delivered (e.g. the port can't be opened), the pop-up says so and to cut
-motor power immediately. A software stop depends on the PC, the USB link and the controller all
-responding, so it is a convenience, not a substitute for a physical emergency stop that cuts motor
-power.
 
-**Control board (V1.13.0).** Two ways to write voltages to the board, each with its own **SET**
-button (nothing is written until SET is pressed):
+If the reset couldn't be delivered, the pop-up says so and to cut motor power now. A software stop
+needs the PC, USB link and controller all working: it doesn't replace a physical emergency stop.
+
+**Control board.** Each row has its own **SET** button; nothing is written until it's pressed.
 - **Set all outputs to (V):** every output to one voltage.
-- **Set voltage by .csv:** choose **H** or **L**, browse to a .csv, press SET. The file is read
-  exactly as for a voltage pattern scan (see "Voltage pattern scans"): element names (`H1_1`,
-  `E1_1`), one column in row order (first value = element 1_1 of the chosen density), or a
-  rows x columns grid (64 x 32 for H, 32 x 32 for L). A file that doesn't fit the chosen density is
-  refused with the reason, and nothing is sent. With the pixel controller the whole board is set:
-  elements not in the file go to 0 V (the status line says so). The Pi controller can only set the
-  chosen density, so a file that also sets the other density's elements is refused.
+- **Set voltage by .csv:** choose H or L, browse to a file, SET. The file is read exactly like a
+  pattern-scan file (see "Pattern CSV files"). With the pixel controller the whole board is set and
+  elements not in the file go to 0 V. The Pi controller can only set the chosen density.
 
-**VNA (V1.13.0).** **Scan** makes the VNA do one sweep with whatever it's currently set to, using
-the same trigger the scans use (`:TRIG:SING; *OPC?`, then reading the reply so it isn't left in the
-buffer). Nothing is configured, fetched, saved or plotted. The connection stays open between
-presses, reconnecting if a VNA setting is changed.
+**VNA.** **Scan** triggers one sweep with whatever the VNA is currently set to, using the same
+trigger the scans use (`:TRIG:SING; *OPC?`, reading the reply). Nothing is configured, saved or
+plotted.
 
-The board and VNA connections, like the stage's, are released automatically when a scan or
-calibration starts and when the app closes; all panel controls are greyed out while one runs.
+## Scans
 
-**Safe area (V1.12.0).** The safe area is the box around every point a scan could visit with the
-current geometry (both densities), in plot coordinates, extended by 10 mm (`SAFE_MARGIN_MM` in
-`scan_tab.py`) on every side; the plot shows it as a dashed red outline. With the default geometry
-the scan points span X -218.2 to 0 and Y -190 to 0, so the safe area is X -228.2 to +10, Y -200
-to +10. Before every Go / Move, the panel reads where the stage is, works out the exact target and,
-if it's outside the safe area, asks first: the dialog says where the target is, where the limits
-are and how far past them it goes, with **Confirm move** and **Cancel**. Cancel is the default
-(Enter and Escape cancel too), so leaving the safe area always takes a deliberate click. Cancel
-leaves the stage exactly where it is (nothing is sent); Confirm moves it exactly where instructed.
-Scans aren't affected, since every scan point is inside the area by definition. The safe area
-follows the Settings geometry, so it moves with the grid size and spacing.
+**Voltage sweep** (`uniform_board_mode` on, the default): for each voltage, set every element to
+it, wait the settle time, then visit and measure every element of the scanned density. Options:
+`uniform_board_settle_per_point` re-sends the voltage and waits before every point. With
+`uniform_board_mode` off, each point is measured with only its own element at the voltage
+(`single_pixel_settle_s`).
 
-Verified with real tkinter and simulated hardware: go-to and move-by land on the calibrated
-position for the plot coordinates entered (with a stage calibration that has real scale and skew
-errors) and the readout shows plot coordinates; the red box follows; non-numbers are refused;
-starting a scan releases the panel's connection; STOP writes 0x18 to the serial line, ends a
-move or a wait in progress at once, reaches a running scan's own connection, cancels the scan
-without a misleading "Scan failed" message, opens the port when nothing is connected, and warns
-plainly if even that fails; and afterwards every motion control, Start Scan and Calibrate stay
-locked. Safe area: a move to 1 mm inside the border goes without a
-question; 1 mm outside asks, Cancel leaves the stage untouched and Confirm goes exactly there;
-relative moves, and the positive (+10 mm) side, are checked the same way; the other controls stay
-locked while the question is open; and the real dialog cancels on Enter and has Cancel focused. Control board and VNA: "set all" reaches all 3072 outputs; an H grid file and an
-L one-column file put every element's value on its own controller output (through the pinout) with
-the rest at 0 V; files that don't fit the chosen density, or set the other density on the Pi, are
-refused with nothing sent; and VNA Scan sends the scans' trigger and nothing else (no settings, no
-data), and reuses the connection.
+**Voltage pattern** (Scan type: Voltage pattern (CSV)): set every element to its own voltage from a
+CSV, once, wait the settle time, then measure every element of the scanned density once.
 
-## Calibration walkthrough (V1.8.0)
+The stage visits points row by row, reversing direction on each row of the scanned density
+(serpentine), so no move is longer than one row step. At the end it returns to the origin
+(`return_home`).
 
-**Settings > Calibrate...** opens a guided window that does the stage calibration and, optionally,
-the copper-plate surface calibration, one step per page. The left side lists every step (with
-ticks as they're done); each page says exactly what to do, a small board map shows where the
-probe is and which sites are done, and one button says what happens next. Hardware runs in the
-background so the window never freezes.
+### Pattern CSV files
 
-Before you start: set **Stage calibration file** in General settings (surface calibrations are saved
-in the same folder; set **Surface calibration folder** only to save them somewhere else), and keep
-the VNA sweep exactly as it will be for the scans (the surface calibration only
-applies to scans with the same band and points). Calibrate releases the Scan tab's manual-control hardware and
-is refused while a scan is running.
+Element names come from the pinout, 1-indexed: L elements `E1_1`..`E32_32`, H elements
+`H1_1`..`H64_32` (`L1_1` and `H_1_1` also accepted). Three layouts (`pattern.py`):
+- **Labelled:** rows of `name, voltage` (e.g. `H1_1, 2.5`); may mix E and H; elements left out get 0 V.
+- **One column (or row):** one value per element of the chosen density, row by row: the first value
+  goes to element 1_1, then 1_2 ... 1_32, 2_1, and so on (2048 values for H, 1024 for L).
+- **Grid:** the density's shape (64 x 32 for H, 32 x 32 for L); CSV row r, column c = element row r,
+  column c. Text header lines are skipped; a header row of numbers would count as data.
 
-1. **Before you start** page: choose stage calibration, surface calibration, or both, and the plate
-   set: plates at 0, 1 and 2 mm at every site (most accurate), or all three at the centre and only
-   the surface plate at the corners (faster). Optionally tick the **accuracy check**: one extra
-   1.5 mm plate at the centre. The page lists what's needed and where results go.
-2. **First L element (origin)**: nudge the probe onto it with the arrow buttons (choose a step size
-   from 0.05 to 5 mm) or by typing a nudge such as `0.2, -0.1`. That spot becomes (0, 0). Always
-   done, since every position after it is measured from there.
-3. **Far Y** and **far X** elements (stage calibration): the stage drives near each; nudge it on.
-   The scale and skew are solved and saved to the stage calibration file straight away.
-4. **Copper plates** (surface calibration): five sites, the centre first and then the four corners
-   (each inset 5% from the outermost elements). The stage drives to
-   each site on its own; the page says which plate to place (flat on the surface, then on the 1 mm
-   spacers, then the 2 mm spacers) and the operator clicks **Measure** (3 sweeps, averaged by
-   `nfp_calibrate`). Each raised-plate measurement is checked at once against the phase change its
-   spacer should give (2kd at the band centre); if it's more than 25 deg off, the page says to
-   check the spacer, flatness and centring and offers **Measure again**.
-5. **Solve and save**: `nfp_calibrate`'s calibration runs on the measurements. The page shows the
-   surface height found at each site (relative to the centre), the warp model fitted, and any
-   problems in plain words (a site that fits poorly, an unphysical probe reflection, plates that
-   barely differ), with the script's full report underneath. With the accuracy check, it also shows
-   how far the corrected 1.5 mm plate is from an ideal one: the phase error (median, and its range
-   across the band) and the amplitude error. It's flagged if the median phase error is over 3 deg or
-   the amplitude error over 0.5 dB; for scale, a 0.1 mm wrong spacer moves the phase about 4.6 deg at
-   19 GHz. Nothing is saved until **Save**.
-   At the end the stage returns to the first L element, so a scan can start there.
+A file that doesn't fit (wrong count or shape, a voltage outside the controller's range, an unknown
+or repeated name) is refused with the reason before anything moves.
 
-Cancel at any point: measurements are discarded and nothing else is touched. A stage calibration
-completed before cancelling stays saved.
+**What's recorded is what was sent.** The pixel controller keeps the last code it sent to each of
+its outputs (as each batch is acknowledged); each element's saved voltage `e` is that code turned
+back into volts. It therefore includes the DAC's 12-bit resolution (2.44 mV steps) and the 0 V given
+to elements not in the file. The CSV's own value is saved alongside as `pattern_csv_v`. With the Pi
+controller it's the value written to the Pi's grid file. No controller here reads voltages back, so
+this is the commanded output, not a measurement at the element.
 
-**Where calibrations are stored (V1.9.0).** The stage calibration is the **Stage calibration file**
-(`.json`: scale and skew), written as soon as the far-X element is confirmed; it's overwritten by
-each stage calibration. Each surface calibration is saved as a **new dated folder**,
-`surface_cal_<YYYY-MM-DD_HHMM>`, in the same folder as the stage calibration file (or in the
-**Surface calibration folder**, if one is set). Nothing is overwritten, so every earlier surface
-calibration stays available. A second calibration in the same minute gets `_2`, `_3`... While the
-walkthrough runs, measurements go into `<name>.incomplete`, renamed to `<name>` on Save and deleted
-on Cancel. The Analysis tab uses the newest set by default (by the time it was made); Browse opens
-the folder holding the sets, to pick an older one.
+## Data saving
 
-**A calibration set folder** is exactly the layout `nfp_calibrate.py` reads, plus two files: `calibration_info.json` (frequency grid, plate set, sites, the stage
-calibration used, date) and `calibration_report.txt` (summary, warnings and the script's report).
-Plate files are `<site>/Surface.npz`, `N1mm.npz`, `N2mm.npz`, each with `sdata` (one row per
-sweep) and `frequencies_hz`; `sites.csv` gives each site's physical position. With the accuracy
-check, the centre folder also has `N1_5mm.npz`; 1.5 mm isn't one of the script's standards (0, 1,
-2 mm), so the script uses it as a validation plate, not to solve. So the script can
-still be run by hand on a set: `python nfp_calibrate.py --f-start 17 --f-stop 21 --n-points 4001
---cal-dir <set> --data-dir <run> --out-dir <out>`.
+Each scan writes into `output directory / run name`, and refuses to start if that folder already
+holds scan data.
 
-**In the Analysis tab**, choose Surface calibration; the Calibration folder defaults to the newest
-set. The tab solves the set (a second or two) and corrects every element in memory,
-exactly as the script would write it; output folders made by running the script by hand still work
-too. The set must have been measured with the same sweep as the run, or the tab says so.
-
-Verified with simulated hardware (the simulated GRBL stage with real scale and skew errors, started
-12 mm off the first L element; a simulated VNA returning what the plate gives at the probe's true
-position on a warped board; a simulated operator clicking through every page): the stage
-calibration is recovered to 2e-6; a plate on the wrong spacer is flagged and accepted after
-re-measuring; the saved set is complete; the stage parks on the first L element; the in-app
-correction is identical (to 1e-12) to running `nfp_calibrate.py` from the command line on the same
-set; and the Analysis tab with the walkthrough's set recovers every element of a warped array
-exactly, with either plate set. Cancelling keeps the previous set, and missing save locations are
-explained before anything connects.
-
-## Stage calibration
-
-The hex grid geometry computes *ideal* coordinates; the physical stage rarely matches
-that exactly (skew, scale error from mounting/belts/etc). `StageCalibration` (in
-`stage.py`) is a linear correction: `scale_x`, `skew_x`, `scale_y`, `skew_y`, applied as
-
-```
-physical_x = ideal_x * scale_x + ideal_y * skew_x
-physical_y = ideal_y * scale_y + ideal_x * skew_y
-```
-
-`GrblXY` loads this from `StageConfig.calibration_file` (a JSON file) on construction —
-if the file doesn't exist or isn't set, it defaults to an identity transform (no
-correction), so nothing breaks if you haven't calibrated yet. `run_scan.py` always moves
-to points via `stage.goto_ideal_xy(...)` / `stage.wait_until_reached_ideal(...)`, which
-apply this transform automatically — the scan loop itself never has to think about
-calibration at all.
-
-**Calibration protocol: three L elements, no homing.** Calibration starts wherever the stage is,
-and every target is an L element:
-1. **Origin: the first L element (L row 1, col 1).** Nudge the stage onto it; that spot becomes
-   (0, 0). The planner always puts this element at (0, 0), whatever the L sub-grid setting.
-2. **Far Y: the farthest L element straight down from the origin (x = 0).** Only every other L row
-   has an element on that line (the rows between are offset by half a pitch), so with 32 L rows
-   it's L row 31. At 4 mm spacing: (0, -180) mm.
-3. **Far X: the farthest L element straight across from the origin (y = 0)**, the last element of
-   the first L row. At 4 mm spacing: (-214.774, 0) mm.
-
-Both corners are exactly on the axes, so each measures one axis's scale and the other axis's
-skew directly (`calibrate_stage.solve_calibration()` still solves the general 2x2 system, which
-reduces to that). At the end the stage is sent back to the first L element, so a scan started next
-begins at the same origin. Verified on the simulated stage, including starting 25 mm away from the
-first L element: the coefficients come back to about 2e-6.
-
-**To calibrate:** use **Calibrate...** at the bottom of the Settings tab; see "Calibration
-walkthrough" above.
-
-**Move timeouts and stage coordinates (fixed in V1.4.8).** Two bugs made calibration fail with
-"Stage did not reach target" while the stage was still moving:
-
-1. `wait_until_reached` allowed a fixed 30 s for every move. At the default 500 mm/min (8.3 mm/s)
-   that cuts off any move longer than 250 mm. On a 4 mm, 32 x 32 grid, origin to far Y is about
-   186 mm (22 s, fine), but far Y to far X is a 281 mm diagonal (34 s), so calibration always died
-   on the second extent. The timeout is now sized to each move:
-   travel time at `stage.feed_mm_per_min` x `stage.move_timeout_factor` (1.5) +
-   `stage.move_timeout_extra_s` (10 s). Both are under Advanced > Motor stage. A timeout now reports
-   the last position read, the move length, and the feed rate.
-2. Position readback compared software targets against GRBL's raw machine position (MPos), which
-   only works if MPos happened to be 0 at the software zero. Re-zeroing at the nudged origin during
-   calibration didn't reset MPos, so after any origin nudge every later check was off by the nudge
-   (and the saved calibration absorbed that error); connecting with the stage away from MPos 0 failed
-   immediately. `GrblXY` now records MPos at connect and at every `set_software_zero_here()`, and
-   `get_pos()` reports position relative to it, so readback is always in the commanded frame.
-
-Verified against a simulated GRBL stage (moves at the real feed rate on a virtual clock, reports
-interpolated MPos): the old code reproduces all three failures (no nudge: times out on far X; origin
-nudge: times out on far Y; stage not at MPos 0: times out on the origin). The fixed code completes
-all three and recovers a known stage scale/skew to about 2e-6, the limit of GRBL's 3-decimal
-moves. Full L and H scans (two voltage steps each, including the jump back to the first point)
-also run cleanly on the simulator.
-
-## Stagger direction
-
-`ScanGeometryConfig.stagger_sign` (`+1.0` default, or `-1.0`) mirrors which side the
-offset rows overhang. This is a different knob from `offset_odd_rows`: that one picks
-*which* rows get the half-spacing offset (odd vs even), while `stagger_sign` flips the
-*direction* of that offset. For an infinite lattice these would be equivalent, but the
-grid is finite, so they change different things — `offset_odd_rows` shifts the whole
-checkerboard pattern by half a spacing, while `stagger_sign` mirrors which edge of the
-array the offset rows stick out past.
-
-Exposed in the Settings tab as a checkbox, **"Mirror stagger direction"**, in the Scan
-Geometry section — unchecked is `+1.0`, checked is `-1.0`. Unlike `offset_odd_rows` /
-`x_direction_sign` / `y_direction_sign` (still config-only, since those are rig-mount
-constants), this one's visible and live-updates the Scan tab's preview the moment you
-toggle it, on the theory that "does the plot look right" is exactly when you'd want to
-flip it.
-
-## Scan geometry — L/H interleaved density
-
-The board is three hex grids interleaved into one denser hex grid. Remove one of them (**L**) and the
-other two are **H**. `rows` and `cols` are the size of *one* sub-grid, so 32 x 32 gives
-3 x 32 x 32 = 3072 points: 1024 L and 2048 H.
-
-**`spacing_mm` is the nearest-neighbor spacing of the full interleaved grid (changed in V1.4.4).** It's
-the smallest point-to-point distance on the board. Each sub-grid on its own is a hex grid with
-`sqrt(3) * spacing_mm` between neighbors, which `HexGridPlanner.sub_spacing_mm` derives. Concretely,
-for spacing `a`:
-- points along a row are `sqrt(3) * a` apart (`sub_spacing_mm`), with alternate rows offset by half that;
-- full-grid rows are `a / 2` apart (`dense_row_spacing_mm`, overridable via `row_spacing_mm`);
-- every 3rd row is L, so L rows are `1.5 * a` apart (`row_spacing_mm` property).
-
-Rows are horizontal. That makes L a normal flat-row hex grid, and makes the full grid the same lattice
-rotated 30 degrees: its nearest neighbors are at +/-30 degrees and straight up/down, not along a row.
-Example: 6.8 mm full-grid spacing gives 11.78 mm sub-grid spacing and a 32 x 32 array spanning about
-365 x 323 mm. Before V1.4.4 `spacing_mm` meant the L sub-grid's spacing, so **presets saved with
-older versions need their spacing divided by sqrt(3)** to describe the same physical board (and a
-`row_spacing_mm` override, which used to mean L row pitch, needs dividing by 3).
-
-Two new fields control this:
-- **`l_subgrid`** (1, 2, or 3) — which of the 3 possible row-phases within each dense
-  3-row group is L. Doesn't change point *count*, just which physical rows count as L
-  vs H.
-- **`density_mode`** ("L" or "H") — which one is actually active: scanned (moved to,
-  measured) and shown as blue→green progress in the Scan tab. The other density is
-  plotted too (for context) but stays grey and is never touched by the stage or the
-  controller.
-
-Both are in the Settings tab's Scan Geometry section, live-updating the Scan tab's
-preview the same way rows/cols/spacing already did.
-
-**Why this replaced the old skip-pattern mechanism:** the very first version of this
-scan (your original `LegacySerpentinePlanner`) approximated something like this with
-mod/remainder skip logic on a single lattice. Since then the pipeline moved to a clean
-single hex lattice with no skipping at all. This reintroduces the ability to scan a
-subset — but properly, as two well-defined interleaved sub-lattices with known geometric
-relationships (verified: pulling out L's points alone and checking nearest-neighbor
-distances gives a perfectly uniform hex lattice, and H is always exactly 2x L's count),
-rather than an arbitrary skip pattern.
-
-**Serpentine order alternates per row of the scanned density (fixed in V1.4.7).** It used to
-alternate on the full-grid row number, but L and H rows interleave, so some consecutive H rows ran the
-same direction and the stage flew back across the whole board between them (about 1.5x the necessary
-travel for an H scan). It now alternates on `logical_row`, so every move in an L or H scan is at most
-one row step. `x_loop` (visit index within a row, used in per-point filenames) changes accordingly for
-H rows that used to run the other way.
-
-**`ScanPoint.logical_row` is each point's index *within its own density*** — 0 to
-`rows-1` for L, 0 to `2*rows-1` for H — matching the pinout's own row numbers (E5_9 is L row 4;
-see "Element addressing" below), and deliberately *independent* of `l_subgrid`: which
-physical pin drives "the 5th L element" doesn't change just because that element's
-physical position moved to a different lattice phase. (`l_subgrid` only affects the
-internal `dense_row` used to compute `stage_x_mm`/`stage_y_mm` — it never reaches
-`logical_row`.) L and H `logical_row` ranges legitimately overlap (both start at 0),
-which is why the Scan tab's point lookup and the pinout lookup are both keyed with
-density alongside row/col, not row/col alone.
-
-## Current scan order
-
-In `uniform_board_mode=True` the scan runs in this order:
-
-1. Set all 3072 pixels to one voltage
-2. Scan every active point (whichever density `density_mode` selects — L or H, not both)
-3. Collect VNA at each stage point
-4. Move to next voltage and repeat
-
-## Data saving (V1.4.9)
-
-Each scan writes into `output_directory/run_name/`, and refuses to start if that folder already
-holds scan data (pick a new run name rather than silently overwriting a previous run).
-
-**One file per visited coordinate**, named `<density>_R<row>_C<col>.npz` (row/col 0-indexed within
-that density, e.g. `L_R005_C012.npz`). This follows the legacy protocol: the first time a coordinate
-is visited, its file is created with every array already at its final size and empty (NaN); each
-later visit, at the next voltage, rewrites the file with everything saved so far plus the slot just
-measured. So at any moment, including after a crash or a cancelled scan, each file holds every
-voltage measured there so far, and `measured` says which slots are real. Writes go to a temporary
-file that is then renamed over the old one, so a failure mid-write can't corrupt a file that already
-holds earlier voltages.
+**One file per element**, `<density>_R<row>_C<col>.npz` (row and column 0-indexed within the
+density, e.g. `L_R005_C012.npz`). The file is created at the first visit with every array at its
+final size and empty (NaN); each later visit fills its voltage's slot and rewrites the file
+(atomically, via a temporary file). After a crash or a cancel, each file holds every voltage
+measured there so far.
 
 | Key | Shape | Contents |
 | --- | --- | --- |
-| `e` | (V,) | voltage applied at each slot, NaN until measured (legacy key) |
-| `iteration` | () | index of the voltage slot written most recently (legacy key) |
-| `sdata` | (V, N) | raw complex S11, unrounded |
+| `sdata` | (V, N) | complex S11 (magnitude and phase are `np.abs` / `np.angle` of it) |
+| `e` | (V,) | voltage applied at each slot; NaN until measured |
+| `iteration` | () | the slot written most recently |
 | `measured`, `measured_time` | (V,) | which slots hold data, and when (Unix time) |
-| `voltages_v` | (V,) | the full planned voltage list |
-| `frequencies_hz` | (N,) | frequency axis from the VNA's read-back start/stop/points (linear sweep) |
-| `density`, `logical_row`, `logical_col` | () | which element this is |
-| `stage_x_mm`, `stage_y_mm` | () | ideal (planned) position |
-| `physical_x_mm`, `physical_y_mm` | () | position after the stage calibration correction |
-| `y_loop`, `x_loop` | () | full-grid row, and visit index within that row |
+| `voltages_v` | (V,) | the planned voltage list |
+| `frequencies_hz` | (N,) | frequency axis from the VNA's read-back sweep (linear) |
+| `density`, `logical_row`, `logical_col` | () | which element |
+| `stage_x_mm`, `stage_y_mm` | () | planned position (plot coordinates) |
+| `physical_x_mm`, `physical_y_mm` | () | position after the stage calibration |
+| `y_loop`, `x_loop` | () | full-grid row, and visit index within it |
+| `scan_type`, `element`, `pattern_csv_v` | () | pattern scans only: `"pattern"`, pinout name, CSV value |
 
-V = number of voltages, N = VNA points. Magnitude and phase aren't stored (V1.4.10), since they
-come straight from `sdata`: `np.abs(sdata)` and `np.degrees(np.angle(sdata))`. At 4001 points
-that's about 64 kB per voltage per file, so 0.32 MB per coordinate for 5 voltages, and roughly
-330 MB for a 5-voltage L scan (1024 files) or 660 MB for H.
+V = voltages (1 for a pattern scan), N = VNA points. At 4001 points: about 64 kB per voltage per
+file, so about 330 MB for a 5-voltage L scan and 660 MB for H.
 
-**`metadata.json`** is written once the hardware has connected, so it records what was actually
-used: the full config, the voltage list, the frequency axis (start/stop/points from the VNA's
-read-back), the stage calibration coefficients actually loaded (not just the file path, which could
-be overwritten by a later recalibration), the active-point list in visit order, and the start time.
+**`metadata.json`**, written once the hardware has connected: the full settings, voltages, frequency
+axis, the stage calibration coefficients actually loaded, the point list in visit order, and the
+start time. Pattern scans also save `voltage_pattern_source.csv` (the file as given) and
+`voltage_pattern_applied.csv` (all 3072 elements: name, row, column, controller output, applied and
+CSV voltage).
 
-**Optional whole-run summary** (`save.save_summary_npz`, now off by default): `summary_sdata.npy`,
-one disk-backed complex array of shape (points, voltages, N) in active-point order, plus
-`summary_index.npz` (`voltages_v`, `active_points`, `frequencies_hz`) when the scan completes. It
-duplicates the per-coordinate files, doubling disk use, so turn it on only if an analysis wants
-everything in one array.
+Optional (`save.save_summary_npz`, off by default): `summary_sdata.npy`, every trace in one array,
+plus `summary_index.npz`. It duplicates the per-element files.
 
-The V1.4.3-V1.4.8 layout (one file per measurement, `V###_C###_R###_Y###_X###.npz`, with `sdata`
-only) is gone; per-coordinate files replace it.
+## Analysis tab
 
-Verified with dry-run scans fed recognisable fake traces: one file per coordinate, every slot holds
-exactly its own (point, voltage) trace, calibrated coordinates and
-the frequency axis are correct, a cancelled scan leaves earlier voltages intact with the rest NaN,
-a reused run name is refused, and a simulated disk error mid-write leaves the existing file loadable
-with its earlier data.
+1. **Dataset folder:** browse to a run folder and **Load** (it starts with the current run's
+   folder). Loading runs in the background; the line underneath says what was found.
+2. **Correction:**
+   - **Time-domain gate** (default), using the gate settings under Processing options; or
+   - **Surface calibration**, with a **Calibration folder**: either a set saved by the calibration
+     walkthrough (the newest is filled in by default), or a folder made by running
+     `nfp_calibrate.py` by hand. A set is solved and applied in memory, exactly as the script
+     would; it must have been measured with the same VNA sweep as the run. Switching correction
+     doesn't reload the run from disk.
+3. **Heatmap:** every element at its position, coloured by the chosen measure at a reference
+   frequency. Sweep runs: phase range across voltage, phase at the last voltage, or magnitude range.
+   Pattern runs: phase (gated, no reference), gated magnitude, or applied voltage. With surface
+   calibration: also the surface gap (the fitted warp). All heatmaps use the same colours (viridis);
+   phase spans -180 to 180 deg; applied voltage uses a logistic colour scale (below).
+4. **Element plots:** click an element or type its row and column (0-indexed) and Show. Sweep runs
+   show phase and magnitude vs voltage (at each reference frequency) and vs frequency (for each
+   voltage); pattern runs show phase and magnitude vs frequency. Legends sit outside the plots; with
+   more than 10 lines a colour bar replaces the legend. Save heatmap... / Save plot... write PNG or
+   PDF.
+5. **Phase reference** (sweep runs): linear trend or first voltage. Pattern runs subtract nothing.
+6. **Processing options:** reference frequencies (default 18-20 GHz for low band, 27-29 GHz for high
+   band), gate width and Tukey alpha (then Reprocess), and the voltage colour scale.
 
-## The origin and the L sub-grid
+**Logistic voltage colour scale.** Applied voltage is coloured by
+1 / (1 + exp(-(V - midpoint) / width)), so equal colour steps follow an element's S-shaped
+phase-vs-voltage response rather than equal volts. Midpoint and width (default 5 V and 1.5 V) are
+under Processing options; set them from the device's measured curve.
 
-**The origin is always the first L element** (L row 1, col 1), for calibration, scans, the Debug
-tab, and the saved `stage_x_mm`/`stage_y_mm`. The planner shifts the whole grid so that element is
-at (0, 0). With L sub-grid 1 nothing changes from V1.4.10; with 2 or 3 every position shifts by that
-element's old offset, and H rows above the first L row get positive coordinates.
+**Voltage map rotated 180 deg** (pattern runs). The machine origin is set for the tooling, not by
+where element E1_1 is, so the software can't know which way round the board's numbering runs. If
+the voltage map comes out rotated from the board, tick this: each element then shows the voltage
+of the element at the position mirrored through the board's centre (from the run's
+`voltage_pattern_applied.csv`). Display only; the data and the board are unchanged.
 
-**L sub-grid** now only says how many H rows sit above the board's first L row: 1 = none (the
-board's first row is L), 2 = one, 3 = two. Because the origin is always on an L element, a wrong
-setting can no longer put H points on L elements (verified for every setting/board combination);
-it can only shift which H rows at the edges get scanned, and which H row is numbered 0.
+The Analysis tab also reads files from the original analysis script (`amplitudes`/`phases` keys,
+`C#R#` names; 16-24 GHz is assumed when a file has no frequency axis).
 
-## Notes
+## Calibration
 
-- Stage defaults to `COM10`
-- Pixel controller defaults to `COM7`
-- `vna.py` connects to `VNAConfig.visa_resource` (default `TCPIP0::192.168.6.150::inst0::INSTR`)
-  via `VNAConfig.visa_backend` (default `'@py'`, the pure-Python `pyvisa-py` backend — no
-  NI-VISA/vendor driver install needed; set to `''` to use pyvisa's default instead)
-- `VNAController.initialize()` checks the instrument's error queue (`SYST:ERR?`, standard
-  on any SCPI instrument) after every command it sends, and reads back
-  sweep-type/start/stop/points afterward to confirm they actually took effect — plain
-  `instr.write()` never raises on its own even if the instrument rejects a command, so
-  without this a bad command (wrong value, wrong mode, unsupported on this model) fails
-  completely silently. If the VNA isn't ending up with the sweep settings you configured,
-  this will now raise `RuntimeError` naming either the specific rejected command and the
-  instrument's own error text, or the exact requested-vs-actual mismatch if the
-  instrument accepted the command but didn't apply it (often a channel/trace selection
-  issue). This also replaces the old fixed `time.sleep(1)` between each command with the
-  query itself as the sync point, which is instrument-paced rather than guessed.
+**Settings > Calibrate...** opens a walkthrough: the steps are listed on the left and tick off as
+they're done; each page says exactly what to do, a board map shows where the probe is, and one
+button moves on. It needs the Stage calibration file set (surface calibrations are saved next to
+it), and the VNA sweep set exactly as for the scans it will be used with.
 
-- Per-element (mapped) sweeps: set `uniform_board_mode=False`. `PixelController` addresses each
-  element from the pinout automatically; `PiBoardController` needs no addressing on the PC side —
-  see "Using the Pi controller" above.
-- `RunConfig.uniform_board_settle_s` (default 45 s, "Settle time" in General) adds a delay between updating all pixels and
-  starting the X-Y-VNA sweep; `single_pixel_settle_s` is for mapped-element mode
-- `RunConfig.uniform_board_settle_per_point` (uniform board mode only):
-  `False` (default) sends the grid once per voltage step, delays once, then scans every
-  point; `True` re-sends the grid and delays again before every single point
+1. **Before you start:** stage calibration, surface calibration, or both; the plate set (0, 1 and
+   2 mm at every site, or all three at the centre and the surface plate only at the corners); and
+   an optional **accuracy check** (an extra 1.5 mm plate at the centre).
+2. **Origin:** nudge the probe onto the first L element (L row 1, column 1) with the arrow buttons
+   (0.05-5 mm steps) or a typed nudge such as `0.2, -0.1`. It becomes (0, 0). There's no homing.
+3. **Far Y** (the farthest L element straight down from the origin) and **far X** (the last element
+   of the first L row): nudge onto each. The stage's scale and skew are solved and saved to the
+   stage calibration file at once.
+4. **Copper plates** at five sites (the centre, then the four corners, each 5% in from the outermost
+   elements): the stage drives there; place the plate flat on the surface, then on the 1 mm and
+   2 mm spacers, and Measure each (3 sweeps). Each raised plate is checked straight away against the
+   phase change its spacer should give; more than 25 deg off asks you to check and Measure again.
+5. **Solve and save:** `nfp_calibrate`'s calibration runs on the measurements. The page shows the
+   surface height at each site, any problems in plain words, the accuracy check if taken (flagged
+   past 3 deg or 0.5 dB), and the script's report. Nothing is saved until Save; the stage then
+   returns to the origin.
 
-## First thing to edit
+Cancel at any point discards the measurements; a stage calibration already completed stays saved.
 
-Open `run_scan.py`, scroll to the bottom `if __name__ == "__main__":` block, and change:
-- output path
-- voltage list
-- run name
+**What gets saved.** The stage calibration file (scale and skew) is overwritten by each stage
+calibration. Each surface calibration is a new dated folder, `surface_cal_<YYYY-MM-DD_HHMM>`, so
+earlier ones are kept; it holds one sub-folder per site with `Surface.npz`, `N1mm.npz`, `N2mm.npz`
+(and `N1_5mm.npz` at the centre with the accuracy check), plus `sites.csv`, `calibration_info.json`
+and `calibration_report.txt`. That's the layout `nfp_calibrate.py` reads, so it can still be run by
+hand: `python nfp_calibrate.py --f-start 17 --f-stop 21 --n-points 4001 --cal-dir <set>
+--data-dir <run> --out-dir <out>`.
 
-Then run:
+**How precise the plates must be.** The 1 mm and 2 mm spacer thicknesses matter most: in
+simulation, a 1 mm spacer that's really 1.01 mm shifts absolute phase by about 2.6 deg and distorts
+phase-vs-voltage curves by about 1 deg, and the 1.5 mm check barely notices it. Measure the spacers
+(aim for +-0.01 mm). A plate sitting uniformly high (e.g. debris) only shifts absolute phase (about
+4.6 deg per 0.1 mm at 19 GHz). The plate material (copper or steel) makes well under 1 deg of
+difference, as long as the surface is clean and uncoated.
 
-```
-python run_scan.py
-```
+**Stage calibration maths.** `StageCalibration` is linear:
+`physical_x = ideal_x * scale_x + ideal_y * skew_x`, `physical_y = ideal_y * scale_y + ideal_x * skew_y`.
+Scans and the panel move with `goto_ideal_xy`, which applies it; without a calibration file it's
+the identity.
 
-## Index or hardware-address commands (V1.10.0)
+## Geometry
 
-Both pixel-controller set commands send 4 bytes per element (a 2-byte identifier and the 12-bit
-code), in the same batches with the same acknowledgements; only the identifier differs. Choose with
-**`pixels.addressing`** under Advanced > Pixel controller (a dropdown):
+The board is three hex grids interleaved into one denser hex grid. One of them is **L**; the other
+two together are **H**. Rows and columns are per sub-grid, so 32 x 32 gives 3072 elements: 1024 L
+(32 x 32) and 2048 H (64 x 32).
 
-- **`index`** (default): `CMD_SET_BY_INDEX` (0x12). The identifier is the element's controller
-  index, 0-3071; the firmware looks up the hardware address in its own wiring table. Correct only
-  if that table is in the order the pinout implies.
-- **`addr16`**: `CMD_SET_BY_ADDR16` (0x10). The identifier is the element's hardware address,
-  `(DAC select << 9) | MUX word`, built from the pinout's `FMC_A2A1A0` and `D8..D0` columns, so the
-  firmware's wiring table isn't involved.
+For full-grid spacing `a` (default 4 mm, the nearest-neighbour distance): elements along a row are
+`sqrt(3) * a` apart (6.93 mm), alternate rows are offset by half that, full-grid rows are `a / 2`
+apart, and every third row is L. At 4 mm a 32 x 32 board spans about 218 x 190 mm.
 
-Everything else is identical either way: which elements get which voltage, the applied-voltage
-record, pattern scans, sweeps, the Scan tab's voltage control. In `addr16` mode even a uniform set sends all 3072
-addresses, so it reads the pinout (once, about half a second).
+- **Origin:** always the first L element, at (0, 0), for calibration, scans and the saved
+  positions.
+- **L sub-grid** (1, 2, 3): how many H rows sit above the board's first L row (none, one, two).
+  Because the origin is on an L element, a wrong setting can't put H points on L elements; it only
+  changes which edge rows of H are scanned and which H row is numbered 0.
+- **Directions:** `geometry.x_direction_sign` / `y_direction_sign` (default -1, -1) set which way the
+  stage moves for increasing column and row; `offset_odd_rows` picks which rows are offset; Mirror
+  stagger direction flips which side they overhang.
+- **Row numbers** (`logical_row`) count within each density (0-31 for L, 0-63 for H), matching the
+  pinout's names (E5_9 is L row 4), and don't depend on L sub-grid.
 
-The pinout's DAC select is now read too, and checked on load: all 3072 hardware addresses must be
-distinct, and each must match the wiring table's `dac_sel_int` and `muxword_hex` at the same index
-(`dac_sel_int` is `FMC_A2A1A0` read as binary; the table's `dac_sel_A0A1A2` text is just the same
-bits in reverse order). Binary cells that Excel has turned into numbers are read by their digits
-(the number 101 means binary 101 = 5). `python pinout.py --export table.csv` now includes each
-element's DAC select and hardware address.
+## Control boards
 
-**Bench check:** program the same asymmetric pattern with `index`, note which elements are driven,
-then switch to `addr16` and program it again. If the board looks the same, the firmware's index
-table matches the pinout and both modes can be trusted; if not, the index table is the suspect,
-since `addr16` bypasses it. The app has never sent `CMD_SET_BY_ADDR16` to real hardware: if the
-firmware doesn't support it, the first batch comes back with an error (e.g. `ERR_CMD`) and the
-app stops and reports it.
+**Pixel controller** (`controller_type = "pixel"`): framed serial protocol, 12-bit codes over
+0-10 V, sent in batches of 512 elements, each acknowledged. Every set, uniform or not, sends each
+element individually.
 
-Verified with a simulated link: both modes put the same code on every one of the 3072 elements
-(addresses decoded independently through the wiring table), using 0x12 and 0x10 respectively; the
-applied-voltage record and dry-run pattern scans are identical; uniform sets send each address
-once; per-element sweeps set the right element; a misspelt mode is refused before anything is
-sent; and a pinout with a duplicated address, or a DAC select that disagrees with the wiring table,
-is refused on load.
+*Addressing.* Each element's address comes straight from `pinout_32x32.xlsx` (`pixels.pinout_file`
+under Advanced to use another board's pinout). `pixels.addressing` chooses how elements are
+identified on the wire:
+- **`index`** (default): `CMD_SET_BY_INDEX` (0x12) with the element's controller index, 0-3071 (its
+  position in the pinout read block by block); the firmware looks up the hardware address in its
+  own wiring table.
+- **`addr16`**: `CMD_SET_BY_ADDR16` (0x10) with the hardware address, `(DAC select << 9) | MUX word`,
+  from the pinout's `FMC_A2A1A0` and `D8..D0` columns; the firmware's table isn't involved.
 
-## How a board element becomes a controller address
+Each time the pinout is loaded it's checked against `Pixel_Map_by_ConnRow.csv`: all 3072 addresses
+must be distinct, and each element's DAC select and MUX word must match the wiring table at its
+index. That catches a different board's spreadsheet, missing or shifted pins, or edited addresses;
+it can't catch two element names swapped between pins. `python pinout.py --export table.csv`
+writes every element's index, MUX word, DAC select, address, connector and pin.
 
-**`PixelController`:** a uniform grid (every value equal) takes a broadcast path that sets every
-output, with no addressing needed. A non-uniform grid or a voltage pattern sets each element by its
-index from the pinout (see "Element addressing" above).
+`pixels.save_to_flash_after_set` (off by default) asks the controller to store the voltages in
+flash after uniform sets and patterns.
 
-**`PiBoardController`** needs no PC-side addressing: the Pi has its own internal element-to-DAC
-map. See "Using the Pi controller" above.
+**Pi controller** (`controller_type = "pi"`): uploads the voltage grid as a CSV over SSH and restarts
+the remote DAC script; the Pi does its own element mapping. The RF band picks which file
+(`lb`/`hb`) gets the grid; the other is uploaded as zeros. It can only set one density at a time,
+and is slower than the serial controller (every set re-uploads and restarts). **`pi.hb_shape` and
+`pi.lb_shape` are placeholders (24, 8) and need the real sizes.** Note the letters overlap but mean
+different things: `density_mode` L/H is low/high element density; the band lb/hb is the RF band.
+
+## VNA
+
+`vna.visa_resource` (default `TCPIP0::192.168.6.150::inst0::INSTR`) through `vna.visa_backend`
+(default `@py`, pyvisa-py). Before a scan, the sweep (band start/stop/points) is set, every command
+is checked against the instrument's error queue, and the settings are read back to confirm they
+took effect. Each measurement triggers one sweep (`:TRIG:SING; *OPC?`) and reads the trace.
+
+## Hardware notes
+
+- Default ports: stage `COM10`, pixel controller `COM7`.
+- Moves wait until the stage reports it's within `stage.position_tolerance_mm` (0.01 mm) of the
+  target. Each move's timeout is its travel time at `stage.feed_mm_per_min` (500) x
+  `move_timeout_factor` (1.5) + `move_timeout_extra_s` (10 s), so long moves aren't cut off.
+- Positions are measured from where the stage was when it connected (or the last zero), not from
+  GRBL's machine zero.
+- A failed scan shows the error message only. The manual controls, the calibration walkthrough and
+  the Analysis tab also print the full traceback to the console window.
+
+## Running without the GUI
+
+`python run_scan.py` runs one scan with the settings in its `if __name__ == "__main__":` block
+(edit the output path, voltages and run name there first). `python calibrate_stage.py` runs a
+stage-only calibration with simple dialogs.
+
+## Adding hardware
+
+`stage.py`, `controller.py` and `vna.py` each define a small interface (`MotorStage`,
+`BoardController`, `VNAInstrument`) that the hardware classes implement. The scan builds a
+`(cols, rows)` array of voltages and passes it to `set_voltage_grid`; turning grid positions into
+hardware addresses is the controller's job. A new board controller needs `ping`, `set_voltage_grid`
+and `close` (and, to record applied voltages in pattern scans, `element_voltage`), plus an entry in
+`AutomatedArrayScanner.connect()` and the Settings tab's controller choice.
+
+## Moving from the original code (Refactor V1.4.3)
+
+- **Spacing means something different.** It's now the nearest-neighbour distance of the full grid;
+  in the original code it was the L sub-grid's spacing. Divide an old spacing by sqrt(3) to describe
+  the same board (and a row-spacing override by 3).
+- **Data files:** one file per element (all voltages in it), replacing one file per measurement.
+- **Pixel mapping files are gone:** addresses come from the pinout directly; presets naming mapping
+  files still load (those entries are ignored).
+- **The Debug tab is gone:** its controls are the Scan tab's side panel.
+
+## Still to check on the real rig
+
+Everything here was developed and tested against simulated hardware (stage, control board, VNA);
+these haven't been confirmed on the real equipment yet:
+- **STOP:** try it once with the motors moving slowly and nothing in the way.
+- **Index order:** set a single element and confirm it's the expected one; or program one
+  asymmetric pattern with `index`, then with `addr16`, and compare (if the firmware rejects
+  `addr16`, the first batch reports an error such as `ERR_CMD`).
+- **Calibration walkthrough** with the real plates: the 25 deg spacer check and the accuracy-check
+  limits may need adjusting to the real probe.
+- **VNA trigger** from the panel's Scan button.
+- **Pi controller** shapes (`pi.hb_shape`, `pi.lb_shape`).

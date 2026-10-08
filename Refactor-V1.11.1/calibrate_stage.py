@@ -116,7 +116,7 @@ if __name__ == "__main__":
     # Edit to match your setup. spacing_mm is the FULL-grid (all three sub-grids
     # interleaved) nearest-neighbor spacing; each sub-grid is sqrt(3) times that.
     stage_config = StageConfig(port="COM10", calibration_file="stage_calibration.json")
-    geometry = ScanGeometryConfig(rows=32, cols=32, spacing_mm=6.8)
+    geometry = ScanGeometryConfig()   # the default geometry: 32 x 32 sub-grids, 4 mm full-grid spacing
 
     targets = HexGridPlanner(geometry).calibration_targets()
     stage = GrblXY(stage_config)

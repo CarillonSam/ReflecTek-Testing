@@ -1,7 +1,7 @@
 # Array Scan Project
 
-**Version 1.13.2.** The Scan tab's plot shows a one-element border around the scan grid (each
-sub-grid N x M drawn as (N+2) x (M+2)), in amber, never scanned. 1.13.1 made the VNA Scan button
+**Version 1.11.1.** The Scan tab's plot shows a one-element border around the scan grid (each
+sub-grid N x M drawn as (N+2) x (M+2)), in amber, never scanned. 1.11.1 made the VNA Scan button
 send the scans' own trigger. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
 presets, data files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug
 fixes bump PATCH.

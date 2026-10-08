@@ -1,5 +1,6 @@
 # Array Scan Project (Candice)
 
+<<<<<<< HEAD
 **Version 1.11.1.** Version numbers follow MAJOR.MINOR.PATCH: a change that makes old presets, data
 files or calibrations invalid bumps MAJOR, a new feature bumps MINOR, and a bug fix bumps PATCH.
 
@@ -22,6 +23,13 @@ python gui_app.py
 tkinter comes with the python.org installer ("tcl/tk and IDLE" ticked), not from pip. If more than
 one Python is installed, use `py -m pip ...` and `py gui_app.py` so both use the same one. NI-VISA is
 optional: only needed if `vna.visa_backend` is cleared to use it instead of `pyvisa-py`.
+=======
+**Version 1.11.1.** The Scan tab's plot shows a one-element border around the scan grid (each
+sub-grid N x M drawn as (N+2) x (M+2)), in amber, never scanned. 1.11.1 made the VNA Scan button
+send the scans' own trigger. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
+presets, data files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug
+fixes bump PATCH.
+>>>>>>> 098ed508e4ec6c3f2801e61f24ef63776a51f220
 
 ## Files
 

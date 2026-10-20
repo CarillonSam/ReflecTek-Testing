@@ -32,12 +32,12 @@ from pattern import element_label
 
 SELECT_COLOR = "#E24B4A"
 MISSING_COLOR = "#D3D1C7"
-HEATMAP_CMAP = "viridis"   # every heatmap (voltage, phase, magnitude, gap) uses this one colour scheme
+HEATMAP_CMAP = "nipy_spectral"   # every heatmap (voltage, phase, magnitude, gap) uses this one colour scheme
 # Applied-voltage heatmaps use a logistic colour scale, matching the S-shaped (logistic) way an
 # element's phase responds to voltage, so equal colour steps are roughly equal steps along that
 # curve. Midpoint/width are editable under Processing options; these are only starting values.
-LOGISTIC_MIDPOINT_V = 5.0
-LOGISTIC_WIDTH_V = 1.5
+LOGISTIC_MIDPOINT_V = 2.0
+LOGISTIC_WIDTH_V = 1.0
 VOLTAGE_CMAP = "cool"       # lines on the two vs-voltage plots (one per reference frequency)
 FREQUENCY_CMAP = "viridis"  # lines on the two vs-frequency plots (one per voltage)
 

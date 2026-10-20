@@ -124,18 +124,18 @@ class ScanGeometryConfig:
 
 @dataclass
 class PiControllerConfig:
-    host: str = "raspberrypi.local"
-    username: str = "pi"
-    password: str | None = None
+    host: str = "169.254.232.2"
+    username: str = ""
+    password: str | None = "password"
     key_filename: str | None = None
     port: int = 22
 
     local_file_hb: str = "hb_voltages.csv"
     local_file_lb: str = "lb_voltages.csv"
-    remote_file_hb: str = "/home/pi/hb_voltages.csv"
-    remote_file_lb: str = "/home/pi/lb_voltages.csv"
-    remote_command: str = "python3 /home/pi/dac_driver.py"
-    stop_file: str = "/home/pi/stop.txt"
+    remote_file_hb: str = "/home/carillon/Desktop/DataHB.txt"
+    remote_file_lb: str = "/home/carillon/Desktop/DataLB.txt"
+    remote_command: str = "python3 /home/carillon/Downloads/temp.py"
+    stop_file: str = "/home/carillon/Downloads/STOP.txt"
     stop_settle_s: float = 1.0
 
     # The Pi has its own internal element -> DAC channel map, so no PC-side mapping is
@@ -147,7 +147,7 @@ class PiControllerConfig:
     # RunConfig.band (see RunConfig.__post_init__), so set the band there, not here.
     active_band: str = "lb"
     hb_shape: tuple[int, int] = (24, 8)  # (rows, cols) for DataHB.csv when it's the inactive band
-    lb_shape: tuple[int, int] = (24, 8)  # (rows, cols) for DataLB.csv when it's the inactive band
+    lb_shape: tuple[int, int] = (12, 8)  # (rows, cols) for DataLB.csv when it's the inactive band
 
     min_voltage_v: float = 0.0
     max_voltage_v: float = 10.0

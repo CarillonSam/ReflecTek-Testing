@@ -31,7 +31,7 @@ class ScanApp(tk.Tk):
         header = ttk.Frame(self, padding=(12, 10, 12, 4))
         header.pack(fill="x")
         ttk.Label(header, image=self.logo_image).pack(side="left", padx=(0, 8))
-        ttk.Label(header, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(side="left")
+        ttk.Label(header, text=APP_NAME, font=("Edwardian Script ITC", 30, "bold")).pack(side="left")
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)

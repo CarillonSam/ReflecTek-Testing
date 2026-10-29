@@ -38,6 +38,14 @@ class ProgressEvent:
     voltage_v: float
 
 
+class ScanCancelled(Exception):
+    """The operator cancelled the scan from the move-timeout dialog (not an error)."""
+
+
+# What on_move_timeout can answer when the stage doesn't reach a point in time.
+MEASURE_ANYWAY, CANCEL_RETURN_HOME, CANCEL_STAY = "measure", "home", "stay"
+
+
 class AutomatedArrayScanner:
     """
     Coordinates four handlers to run a scan:
@@ -56,16 +64,27 @@ class AutomatedArrayScanner:
         config: RunConfig,
         on_progress: Optional[Callable[[ProgressEvent], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        on_move_timeout: Optional[Callable[[ScanPoint, tuple[float, float] | None, TimeoutError], str]] = None,
     ) -> None:
         """
         on_progress(event) is called after each point is measured — event.step /
         event.total_steps covers the whole run (all voltages x all points), so it's a
         direct progress fraction. cancel_event, if set mid-run, stops the scan cleanly
         after the current point (hardware still gets homed/closed via close()).
+
+        on_move_timeout(point, last_read, error), if given, is asked what to do when the stage
+        doesn't reach a point in time (last_read: where it was, plot coordinates, or None if
+        unreadable). It answers MEASURE_ANYWAY (measure there and carry on), CANCEL_RETURN_HOME
+        or CANCEL_STAY (stop the scan, raising ScanCancelled; the stage is sent to the origin or
+        left where it is, whatever return_home says). Without it, the timeout ends the scan as an
+        error, as before.
         """
         self.config = config
         self.on_progress = on_progress
         self.cancel_event = cancel_event
+        self.on_move_timeout = on_move_timeout
+        self.return_home_override: Optional[bool] = None   # set by the move-timeout answer
+        self.off_target_points: list[ScanPoint] = []        # measured anyway after a timeout
         self.scan_plan = HexGridPlanner(config.geometry)
         self.active_points = self.scan_plan.active_points()
         row_count = config.geometry.rows if config.geometry.density_mode == "L" else config.geometry.rows * 2
@@ -106,7 +125,8 @@ class AutomatedArrayScanner:
         if self.config.dry_run:
             return
         try:
-            if self.config.return_home and self.stage is not None:
+            home = self.config.return_home if self.return_home_override is None else self.return_home_override
+            if home and self.stage is not None:
                 self.stage.home_xy()
         finally:
             for device in (self.vna, self.array, self.stage):
@@ -189,7 +209,27 @@ class AutomatedArrayScanner:
 
         assert self.stage is not None and self.vna is not None
         self.stage.goto_ideal_xy(point.stage_x_mm, point.stage_y_mm)
-        self.stage.wait_until_reached_ideal(point.stage_x_mm, point.stage_y_mm)
+        try:
+            self.stage.wait_until_reached_ideal(point.stage_x_mm, point.stage_y_mm)
+        except TimeoutError as e:
+            if self.on_move_timeout is None:
+                raise
+            try:
+                pos = self.stage.get_pos()
+                last_read = self.stage.calibration.inverse(pos.x_mm, pos.y_mm)
+            except Exception:
+                last_read = None
+            answer = self.on_move_timeout(point, last_read, e)
+            if answer == CANCEL_RETURN_HOME or answer == CANCEL_STAY:
+                self.return_home_override = answer == CANCEL_RETURN_HOME
+                raise ScanCancelled(answer) from e
+            if answer != MEASURE_ANYWAY:
+                raise
+            logging.warning("Stage didn't reach %s row %d col %d (x=%.3f, y=%.3f mm); measured anyway at %s.",
+                            point.density, point.logical_row, point.logical_col, point.stage_x_mm,
+                            point.stage_y_mm, "an unknown position" if last_read is None else
+                            f"x={last_read[0]:.3f}, y={last_read[1]:.3f} mm")
+            self.off_target_points.append(point)
         return self.vna.trigger()
 
     def _frequencies_hz(self) -> np.ndarray:

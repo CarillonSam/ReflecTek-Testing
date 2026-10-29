@@ -30,7 +30,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from run_scan import AutomatedArrayScanner, ProgressEvent
+from run_scan import (CANCEL_RETURN_HOME, CANCEL_STAY, MEASURE_ANYWAY, AutomatedArrayScanner, ProgressEvent,
+                      ScanCancelled)
 from settings_tab import SettingsTab
 from pi_controller import PiBoardController
 from pixel_controller import PixelController
@@ -68,6 +69,7 @@ class ScanTab(ttk.Frame):
         self._cancel_event: threading.Event | None = None
         self._polling = False
         self._scanner: AutomatedArrayScanner | None = None   # the running scan's, so STOP can reach its stage
+        self._timeout_dialog = None   # (window, reply, done) while the move-timeout question is open
 
         # Manual controls (side panel). Hardware is connected on first use and released
         # before a scan or calibration starts (they open their own connections).
@@ -686,6 +688,7 @@ class ScanTab(ttk.Frame):
         scan's and/or the panel's); if none is open, opens the port and sends it there. Then
         cancels any scan, locks the motion controls and tells the operator what to do."""
         self.emergency_stopped = True
+        self._answer_move_timeout(CANCEL_STAY)   # if the timeout question is open: no more motion
         reached, problems = [], []
         if self._cancel_event is not None:
             self._cancel_event.set()
@@ -758,10 +761,13 @@ class ScanTab(ttk.Frame):
 
         def worker() -> None:
             try:
-                scanner = AutomatedArrayScanner(config, on_progress=self._on_progress, cancel_event=cancel_event)
+                scanner = AutomatedArrayScanner(config, on_progress=self._on_progress, cancel_event=cancel_event,
+                                                on_move_timeout=self._ask_move_timeout)
                 self._scanner = scanner
                 scanner.run()
-                self._queue.put(("cancelled",) if cancel_event.is_set() else ("done",))
+                self._queue.put(("cancelled",) if cancel_event.is_set() else ("done", len(scanner.off_target_points)))
+            except ScanCancelled as e:   # chosen in the move-timeout dialog
+                self._queue.put(("cancelled", str(e)))
             except Exception as e:
                 self._queue.put(("error", str(e)))
 
@@ -780,6 +786,67 @@ class ScanTab(ttk.Frame):
         # Runs on the worker thread — must only touch the thread-safe queue here,
         # never widgets or the plot directly.
         self._queue.put(("progress", event))
+
+    def _ask_move_timeout(self, point: ScanPoint, last_read, error: TimeoutError) -> str:
+        """Runs on the worker thread: hands the question to the GUI thread and waits for the
+        answer. The scan stays paused, with the stage wherever it stopped, until then."""
+        reply, done = {"answer": CANCEL_STAY}, threading.Event()
+        self._queue.put(("move_timeout", point, last_read, reply, done))
+        done.wait()
+        return reply["answer"]
+
+    def _show_move_timeout(self, point: ScanPoint, last_read, reply: dict, done: threading.Event) -> None:
+        """The move-timeout question. Not modal, so the red STOP button stays usable while it's open."""
+        from pattern import element_label
+        name = element_label(point.density, point.logical_row, point.logical_col)
+        where = f"x {point.stage_x_mm:.3f}, y {point.stage_y_mm:.3f} mm"
+        if last_read is None:
+            found = "Its position couldn't be read."
+        else:
+            off = float(np.hypot(last_read[0] - point.stage_x_mm, last_read[1] - point.stage_y_mm))
+            found = f"It was last read at x {last_read[0]:.3f}, y {last_read[1]:.3f} mm, {off:.3f} mm away."
+            self._update_stage_box(*last_read)
+        win = tk.Toplevel(self)
+        win.title("Stage didn't reach the point")
+        win.transient(self.winfo_toplevel())
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._answer_move_timeout(CANCEL_STAY))  # closing = no motion
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, justify="left", wraplength=420, text=(
+            f"The stage didn't reach {name} ({where}) in time. {found}\n\n"
+            "The scan is paused. Home is the origin (0, 0).")).pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(14, 0))
+        for text, answer in (("Measure point anyway and continue", MEASURE_ANYWAY),
+                             ("Cancel scan and return home", CANCEL_RETURN_HOME),
+                             ("Cancel scan and stay here", CANCEL_STAY)):
+            ttk.Button(buttons, text=text, command=lambda a=answer: self._answer_move_timeout(a)).pack(
+                fill="x", pady=2)
+        self._timeout_dialog = (win, reply, done)
+        self.stop_button.configure(state="disabled")   # answer here instead; STOP still works
+        self.status_label.configure(text="Paused: the stage didn't reach a point")
+        win.bell()
+        win.lift()
+
+    def _answer_move_timeout(self, answer: str) -> None:
+        if self._timeout_dialog is None:
+            return
+        win, reply, done = self._timeout_dialog
+        self._timeout_dialog = None
+        reply["answer"] = answer
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+        done.set()
+        if self.emergency_stopped:
+            return
+        if answer == MEASURE_ANYWAY:
+            self.stop_button.configure(state="normal")
+            self.status_label.configure(text="Running...")
+        else:
+            self.status_label.configure(text="Stopping...")
 
     def _poll_queue(self) -> None:
         finished = False
@@ -811,12 +878,19 @@ class ScanTab(ttk.Frame):
             self._mark_scanned(event.point)
             self._update_stage_box(event.point.stage_x_mm, event.point.stage_y_mm)
             return False
+        if kind == "move_timeout":
+            self._show_move_timeout(*msg[1:])
+            return False
         if kind == "done":
-            self.status_label.configure(text="Complete")
+            off = msg[1] if len(msg) > 1 else 0
+            self.status_label.configure(text=f"Complete; {off} point{'s' if off != 1 else ''} measured off target "
+                                             f"(see the log)" if off else "Complete")
             self._finish()
             return True
         if kind == "cancelled":
-            self.status_label.configure(text="Cancelled")
+            how = msg[1] if len(msg) > 1 else None
+            self.status_label.configure(text={CANCEL_RETURN_HOME: "Cancelled; stage sent home",
+                                              CANCEL_STAY: "Cancelled; stage left where it stopped"}.get(how, "Cancelled"))
             self._finish()
             return True
         if kind == "error":

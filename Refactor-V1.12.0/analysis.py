@@ -43,7 +43,7 @@ VOLTAGE_ARRAY_KEYS = ["e", "voltages"]
 
 HEATMAP_METRICS = {
     "Phase range across voltage (deg)": "phase_range",
-    "Phase at last voltage (deg)": "phase_last",
+    "Raw phase at voltage (deg)": "phase_at_v",   # pick the voltage in the Analysis tab
     "Magnitude range across voltage (dB)": "mag_range",
 }
 # Voltage pattern runs (one measurement per element, no voltage axis): time-gated, but with
@@ -414,6 +414,9 @@ class Processed:
     # Pattern runs with a reference run: "subtracted" (phase_rel is this run minus the
     # reference), or "missing" (the reference run has no such element: phase_rel is NaN).
     ref_status: str | None = None
+    # Sweeps: the corrected response's phase with no reference subtracted, wrapped to
+    # -180..180 (same as a pattern run's "Phase, no reference"). (n_v, n_f)
+    raw_phase: np.ndarray | None = None
 
     def phase_at(self, idx: int) -> np.ndarray:
         return self.phase_rel[:, idx]
@@ -445,7 +448,7 @@ def process_element(el: Element, settings: AnalysisSettings) -> Processed:
     refs = settings.ref_freqs_ghz or default_ref_freqs(el.freqs_ghz)
     idx = [int(np.argmin(np.abs(el.freqs_ghz - f))) for f in refs]
     return Processed(el.voltages, el.freqs_ghz, mag_db, phase_rel, list(refs), idx,
-                     correction=el.correction, gap_mm=el.gap_mm)
+                     correction=el.correction, gap_mm=el.gap_mm, raw_phase=np.degrees(np.angle(gated)))
 
 
 def process_raw(el: Element, settings: AnalysisSettings) -> Processed:
@@ -550,8 +553,23 @@ def rotated_voltages(ds: Dataset) -> dict[tuple[str, int, int], float]:
     return out
 
 
-def heatmap_value(p: Processed, metric: str, ref_freq_ghz: float) -> float:
-    """One number per element for the heatmap, at the frequency nearest ref_freq_ghz."""
+VOLTAGE_MATCH_V = 5e-4   # a measured voltage counts as the chosen one within this
+
+
+def dataset_voltages(processed: dict) -> list[float]:
+    """Every voltage measured on any element, ascending. Readings within VOLTAGE_MATCH_V of
+    the lowest in their group count as one voltage (the same setpoint read back slightly
+    differently in different files), listed as that lowest reading."""
+    out: list[float] = []
+    for v in sorted(float(v) for p in processed.values() for v in p.voltages):
+        if not out or v - out[-1] > VOLTAGE_MATCH_V:
+            out.append(v)
+    return out
+
+
+def heatmap_value(p: Processed, metric: str, ref_freq_ghz: float, voltage: float | None = None) -> float:
+    """One number per element for the heatmap, at the frequency nearest ref_freq_ghz.
+    "phase_at_v" also needs voltage: NaN (grey) where this element wasn't measured at it."""
     idx = int(np.argmin(np.abs(p.freqs_ghz - ref_freq_ghz)))
     phase, mag = p.phase_at(idx), p.mag_db_at(idx)
     if metric == "surface_gap":
@@ -562,8 +580,11 @@ def heatmap_value(p: Processed, metric: str, ref_freq_ghz: float) -> float:
         return float(mag[0])
     if metric == "applied_v":
         return float(p.voltages[0])
-    if metric == "phase_last":
-        return float(phase[-1])
+    if metric == "phase_at_v":
+        if p.raw_phase is None or voltage is None:
+            return float("nan")
+        hits = np.flatnonzero(np.abs(np.asarray(p.voltages, dtype=float) - voltage) <= VOLTAGE_MATCH_V)
+        return float(p.raw_phase[hits[-1], idx]) if hits.size else float("nan")
     if len(phase) < 2:
         return float("nan")  # a range needs at least two measured voltages
     if metric == "mag_range":

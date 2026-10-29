@@ -123,13 +123,20 @@ class AnalysisTab(ttk.Frame):
         self.metric_combo = metric = ttk.Combobox(opts, textvariable=self.metric_var, values=list(HEATMAP_METRICS),
                                                   state="readonly", width=29)
         metric.pack(side="left", padx=(4, 8))
-        metric.bind("<<ComboboxSelected>>", lambda e: self._draw_heatmap())
+        metric.bind("<<ComboboxSelected>>", lambda e: self._on_metric_changed())
         ttk.Label(opts, text="at").pack(side="left")
         self.heat_freq_var = tk.StringVar()
         self.heat_freq_combo = ttk.Combobox(opts, textvariable=self.heat_freq_var, state="readonly", width=8)
         self.heat_freq_combo.pack(side="left", padx=4)
         self.heat_freq_combo.bind("<<ComboboxSelected>>", lambda e: self._on_heat_freq_changed())
-        ttk.Label(opts, text="GHz").pack(side="left", padx=(0, 12))
+        ttk.Label(opts, text="GHz,").pack(side="left")
+        # Voltage for "Raw phase at voltage": every voltage measured in this dataset.
+        self.heat_volt_var = tk.StringVar()
+        self._volt_choices: dict[str, float] = {}   # dropdown label -> voltage
+        self.heat_volt_combo = ttk.Combobox(opts, textvariable=self.heat_volt_var, state="disabled", width=6)
+        self.heat_volt_combo.pack(side="left", padx=4)
+        self.heat_volt_combo.bind("<<ComboboxSelected>>", lambda e: self._on_heat_volt_changed())
+        ttk.Label(opts, text="V").pack(side="left", padx=(0, 12))
         ttk.Label(opts, text="Phase reference").pack(side="left")
         self.ref_var = tk.StringVar(value="Linear trend")
         self.ref_combo = ref = ttk.Combobox(opts, textvariable=self.ref_var, values=list(PHASE_REFERENCES),
@@ -463,6 +470,12 @@ class AnalysisTab(ttk.Frame):
         self.metric_combo.configure(values=list(metrics))
         if self.metric_var.get() not in metrics:
             self.metric_var.set(next(iter(metrics)))
+        volts = analysis.dataset_voltages(processed) if ds.scan_type != "pattern" else []
+        self._volt_choices = {f"{round(v, 4):g}": v for v in volts}
+        self.heat_volt_combo.configure(values=list(self._volt_choices))
+        if self.heat_volt_var.get() not in self._volt_choices:
+            self.heat_volt_var.set(next(reversed(self._volt_choices), ""))   # default: the last voltage
+        self._sync_volt_combo()
         self.ref_combo.configure(state="disabled" if ds.scan_type == "pattern" else "readonly")
         self._rotated = None  # recomputed for this run when needed
         self.rotate_check.configure(state="normal" if ds.scan_type == "pattern" else "disabled")
@@ -506,7 +519,8 @@ class AnalysisTab(ttk.Frame):
             rotated = self._rotated_voltages()
             values = np.array([rotated.get(k, np.nan) for k in keys])
         else:
-            values = np.array([analysis.heatmap_value(self.processed[k], metric, freq) for k in keys])
+            volt = self._volt_choices.get(self.heat_volt_var.get())
+            values = np.array([analysis.heatmap_value(self.processed[k], metric, freq, volt) for k in keys])
         self._plot_keys, self._plot_xy = keys, xy
 
         _fit(self.heat_canvas)
@@ -522,7 +536,7 @@ class AnalysisTab(ttk.Frame):
         if (~good).any():
             scatters.append(ax.scatter(xy[~good, 0], xy[~good, 1], c=MISSING_COLOR, marker="H", linewidths=0))
         norm, scale_note = None, ""
-        if metric in ("raw_phase", "ref_phase"):
+        if metric in ("raw_phase", "ref_phase", "phase_at_v"):
             norm = matplotlib.colors.Normalize(vmin=-180, vmax=180)  # full circle, so maps are comparable
         elif metric == "applied_v" and good.any():
             mid, width = self._logistic_params()
@@ -535,12 +549,14 @@ class AnalysisTab(ttk.Frame):
         scatters.append(sc)
         self._colorbar = self.heat_fig.colorbar(sc, ax=ax, orientation="horizontal", shrink=0.9, aspect=30)
         self._colorbar.ax.tick_params(labelsize=8)
-        if metric in ("raw_phase", "ref_phase"):
+        if metric in ("raw_phase", "ref_phase", "phase_at_v"):
             self._colorbar.set_ticks([-180, -90, 0, 90, 180])
         elif scale_note:
             self._colorbar.set_ticks(_volt_ticks(vmin, vmax, norm))  # labelled in volts, spaced by the logistic scale
         # The gap and the applied voltage don't depend on frequency, so no "at ... GHz" for them.
         at = "" if metric in ("surface_gap", "applied_v") else f"\nat {freq:g} GHz"
+        if metric == "phase_at_v":
+            at += f", {self.heat_volt_var.get()} V"
         ax.set_title(f"{self.metric_var.get()}{at}{scale_note}", fontsize=9)
         ax.set_xlabel("Stage X (mm)" if physical else "Column", fontsize=8)
         ax.set_ylabel("Stage Y (mm)" if physical else "Row (negated)", fontsize=8)
@@ -591,6 +607,26 @@ class AnalysisTab(ttk.Frame):
         self._draw_heatmap()
         if self.selected in self.processed and self.processed[self.selected].raw:
             self._show(self.selected)  # moves the frequency marker on the raw plots
+
+    def _metric_key(self) -> str | None:
+        return {**HEATMAP_METRICS, **RAW_HEATMAP_METRICS, **REF_HEATMAP_METRICS,
+                **CAL_HEATMAP_METRICS}.get(self.metric_var.get())
+
+    def _sync_volt_combo(self) -> None:
+        """The voltage dropdown is only live for "Raw phase at voltage"."""
+        live = self._metric_key() == "phase_at_v" and bool(self._volt_choices)
+        self.heat_volt_combo.configure(state="readonly" if live else "disabled")
+
+    def _on_metric_changed(self) -> None:
+        self._sync_volt_combo()
+        self._draw_heatmap()
+        if self.selected in self.processed and not self.processed[self.selected].raw:
+            self._show(self.selected)  # adds or removes the voltage marker on the element plots
+
+    def _on_heat_volt_changed(self) -> None:
+        self._draw_heatmap()
+        if self.selected in self.processed:
+            self._show(self.selected)  # moves the voltage marker on the element plots
 
     def _on_heat_click(self, event) -> None:
         if event.inaxes is not self.heat_ax or event.xdata is None or not self._plot_keys:
@@ -643,6 +679,10 @@ class AnalysisTab(ttk.Frame):
         axes = fig.subplots(2, 2)
         _draw_vs_voltage(axes[0, 0], p, phase=True, ylabel=_phase_label(self.settings))
         _draw_vs_voltage(axes[0, 1], p, phase=False, ylabel="Magnitude (dB)")
+        volt = self._volt_choices.get(self.heat_volt_var.get())
+        if self._metric_key() == "phase_at_v" and volt is not None:
+            for ax in axes[0]:
+                ax.axvline(volt, color=SELECT_COLOR, lw=1, ls="--")  # the heatmap's voltage
         _draw_vs_frequency(axes[1, 0], p, p.phase_rel, _phase_label(self.settings), "Phase vs. frequency")
         _draw_vs_frequency(axes[1, 1], p, p.gated_mag_db, _mag_label(p), "Magnitude vs. frequency")
         axes[1, 1].set_ylim(-50, 1)  # as the original script

@@ -1,8 +1,8 @@
 # Array Scan Project
 
-**Version 1.13.2.** The Scan tab's plot shows a one-element border around the scan grid (each
-sub-grid N x M drawn as (N+2) x (M+2)), in amber, never scanned. 1.13.1 made the VNA Scan button
-send the scans' own trigger. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
+**Version 1.14.0.** The Scan tab's motor controls have a nudge pad (X/Y +/- by a chosen step, with
+**Origin** in the middle to go back to (0, 0)) and a **Set origin here** button. 1.13.2 added a
+one-element border around the scan grid on the plot. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
 presets, data files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug
 fixes bump PATCH.
 
@@ -439,7 +439,15 @@ applied, so the probe lands where the plot says:
 - **Position** shows where the stage reports it is (read back from GRBL and converted to plot
   coordinates), updated after every move; **Read** reads it on demand. The red box on the plot
   follows it.
-Each Go waits until the stage has arrived; the controls are greyed out while a move, a scan, or a
+- **Nudge pad** (V1.14.0): **X +**, **X −**, **Y +**, **Y −** move the stage by the **Nudge step**
+  (0.05, 0.1, 0.5, 1 or 5 mm, or type any step). Y + moves up the plot. **Origin**, in the middle of
+  the pad, goes back to (0, 0), the first L element. Clicks while the stage is still moving are
+  ignored, not queued, so the stage never carries on after you stop clicking.
+- **Set origin here** (V1.14.0): makes the stage's current position (0, 0), after asking. It is the
+  same software zero the calibration walkthrough sets on the first L element, so the probe should be
+  centred on that element first. The stage calibration's scale and skew are unchanged; only the
+  origin moves.
+Each Go, nudge and Origin waits until the stage has arrived, and goes through the same safe-area check; the controls are greyed out while a move, a scan, or a
 calibration is running. The panel connects to the stage on first use and keeps the connection
 open between moves; it's released automatically when a scan or calibration starts (they open
 their own) and when the app closes. (Moves use the stage's own move timeout and tolerance, like

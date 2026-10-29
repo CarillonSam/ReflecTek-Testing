@@ -38,6 +38,7 @@ from stage import GrblXY, HexGridPlanner, ScanPoint, emergency_reset_port
 
 # Manual moves outside the box around every scan point, plus this margin, need confirming.
 SAFE_MARGIN_MM = 9.0
+NUDGE_STEPS_MM = ("0.05", "0.1", "0.5", "1", "5")   # same choices as the calibration walkthrough
 ESTOP_STATUS = "EMERGENCY STOPPED. Restart the software before moving the stage."
 EMERGENCY_INSTRUCTIONS = (
     "The stage has been stopped with an emergency reset. It can no longer be trusted to know "
@@ -237,20 +238,43 @@ class ScanTab(ttk.Frame):
             go.grid(row=row, column=2, pady=2)
             entry.bind("<Return>", lambda e, v=var, a=axis, r=relative: self._on_move(v, a, r))
             self._motor_widgets += [entry, go]
+
+        # Nudge pad: X/Y +/- by the chosen step, with "go to origin" in the middle.
+        nudge = ttk.Frame(motors)
+        nudge.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        step_col = ttk.Frame(nudge)
+        step_col.grid(row=0, column=0, sticky="nw", padx=(0, 12))
+        ttk.Label(step_col, text="Nudge step (mm)").pack(anchor="w")
+        self.nudge_step_var = tk.StringVar(value="1")
+        step = ttk.Combobox(step_col, textvariable=self.nudge_step_var, values=NUDGE_STEPS_MM, width=6)
+        step.pack(anchor="w", pady=(2, 0))
+        pad = ttk.Frame(nudge)
+        pad.grid(row=0, column=1)
+        for text, dx, dy, r, c in (("Y +", 0, 1, 0, 1), ("X \u2212", -1, 0, 1, 0), ("X +", 1, 0, 1, 2),
+                                   ("Y \u2212", 0, -1, 2, 1)):
+            b = ttk.Button(pad, text=text, width=6, command=lambda dx=dx, dy=dy: self._on_nudge(dx, dy))
+            b.grid(row=r, column=c, padx=1, pady=1)
+            self._motor_widgets.append(b)
+        origin = ttk.Button(pad, text="Origin", width=6, command=self._on_go_origin)
+        origin.grid(row=1, column=1, padx=1, pady=1)
+        self._motor_widgets += [step, origin]
+
         self.position_label = ttk.Label(motors, text="Position: not read yet", foreground="gray30")
-        self.position_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.position_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         read = ttk.Button(motors, text="Read", width=5, command=self._on_read_position)
-        read.grid(row=5, column=2, pady=(6, 0))
-        self._motor_widgets.append(read)
+        read.grid(row=6, column=2, pady=(8, 0))
+        set_origin = ttk.Button(motors, text="Set origin here", command=self._on_set_origin)
+        set_origin.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._motor_widgets += [read, set_origin]
         # A plain tk.Button so it can be big and red on every platform. Always enabled.
         self.estop_button = tk.Button(motors, text="STOP", command=self.emergency_stop, bg="#C62828", fg="white",
                                       activebackground="#8E0000", activeforeground="white",
                                       font=("TkDefaultFont", 16, "bold"), height=1, relief="raised", bd=3)
-        self.estop_button.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 2), ipady=6)
+        self.estop_button.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 2), ipady=6)
         ttk.Label(motors, text="Stops the stage at once (GRBL reset); restart after.",
-                  foreground="gray40", justify="left").grid(row=7, column=0, columnspan=3, sticky="w")
+                  foreground="gray40", justify="left").grid(row=9, column=0, columnspan=3, sticky="w")
         self.motor_status = ttk.Label(motors, text="", wraplength=250, justify="left")
-        self.motor_status.grid(row=8, column=0, columnspan=3, sticky="w")
+        self.motor_status.grid(row=10, column=0, columnspan=3, sticky="w")
 
         # ---- Control board: one voltage everywhere, or per element from a CSV
         board = ttk.LabelFrame(panel, text="Control board", padding=(10, 6))
@@ -366,12 +390,20 @@ class ScanTab(ttk.Frame):
             return
         what = f"{'Move' if relative else 'Go to'} {axis.upper()} {'by' if relative else ''} {value:g} mm".replace("  ", " ")
 
-        def plan(current):
+        def target(current):
             x, y = current
             if axis == "x":
                 x = x + value if relative else value
             else:
                 y = y + value if relative else value
+            return x, y
+        self._move_checked(config, what, target)
+
+    def _move_checked(self, config, what: str, target) -> None:
+        """Reads where the stage is, works out the exact target (target(current) -> (x, y), plot
+        coordinates), asks before leaving the safe area, then moves. Shared by every motion control."""
+        def plan(current):
+            x, y = target(current)
             self._show_position(current, "")
             outside = self._outside_safe_area(config.geometry, x, y)
             if outside and not self.confirm_outside(self._outside_message(what, x, y, config.geometry, outside)):
@@ -380,6 +412,66 @@ class ScanTab(ttk.Frame):
             self._run_manual(f"{what}...", lambda: self._move_to(config.stage, x, y),
                              lambda pos: self._show_position(pos, f"{what}: done."))
         self._run_manual("Reading position...", lambda: self._plot_position(self._ensure_stage(config.stage)), plan)
+
+    def _on_nudge(self, dx: int, dy: int) -> None:
+        """Nudge pad: move by one step along X or Y. Clicks while the stage is busy are ignored,
+        not queued, so the stage never keeps going after the clicking stops."""
+        if self._manual_busy or self.emergency_stopped:
+            return
+        raw = self.nudge_step_var.get().strip()
+        try:
+            size = float(raw)
+            if not size > 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid step", f"Nudge step must be a number of mm above 0, not '{raw}'.")
+            return
+        try:
+            config = self._manual_config()
+        except ValueError as e:
+            messagebox.showerror("Invalid settings", f"Fix these first:\n\n{e}")
+            return
+        axis, sign = ("X", dx) if dx else ("Y", dy)
+        symbol = "+" if sign > 0 else "\u2212"   # outside the f-string: Python < 3.12 forbids backslashes there
+        self._move_checked(config, f"Nudge {axis} {symbol}{size:g} mm",
+                           lambda c: (c[0] + dx * size, c[1] + dy * size))
+
+    def _on_go_origin(self) -> None:
+        """Origin button (centre of the nudge pad): back to (0, 0), the first L element."""
+        if self._manual_busy or self.emergency_stopped:
+            return
+        try:
+            config = self._manual_config()
+        except ValueError as e:
+            messagebox.showerror("Invalid settings", f"Fix these first:\n\n{e}")
+            return
+        self._move_checked(config, "Go to origin", lambda c: (0.0, 0.0))
+
+    def _on_set_origin(self) -> None:
+        """Makes wherever the stage is now (0, 0): the same software zero the calibration
+        walkthrough sets on the first L element. Asks first, since every position is measured
+        from the origin."""
+        if self._manual_busy or self.emergency_stopped:
+            return
+        try:
+            config = self._manual_config()
+        except ValueError as e:
+            messagebox.showerror("Invalid settings", f"Fix these first:\n\n{e}")
+            return
+        if not messagebox.askokcancel(
+                "Set origin here",
+                "Make the stage's current position the origin (0, 0)?\n\n"
+                "Every position after this, including the plot and the next scan, is measured from here, "
+                "so the probe should be centred on the first L element.",
+                icon="warning", default="cancel"):
+            return
+
+        def work():
+            stage = self._ensure_stage(config.stage)
+            stage.set_software_zero_here()
+            return self._plot_position(stage)
+        self._run_manual("Setting the origin...", work,
+                         lambda pos: self._show_position(pos, "Origin set at the current position."))
 
     def _move_to(self, stage_config, x: float, y: float):
         stage = self._ensure_stage(stage_config)

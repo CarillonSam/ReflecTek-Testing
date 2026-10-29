@@ -7,11 +7,11 @@ from typing import Sequence
 
 @dataclass
 class StageConfig:
-    port: str = "COM10"
+    port: str = "COM13"
     baud: int = 115200
     feed_mm_per_min: float = 500.0
-    settle_s: float = 0.1
-    position_tolerance_mm: float = 0.06
+    settle_s: float = 0.15
+    position_tolerance_mm: float = 0.09
     readback_poll_s: float = 0.1
     startup_delay_s: float = 2.0
 
@@ -68,17 +68,17 @@ class PixelControllerConfig:
 # VNA sweep defaults for each RF band. Picking a band in the GUI's General section loads
 # these into vna.start_hz / vna.stop_hz / vna.points (still editable under Advanced).
 BAND_VNA_DEFAULTS: dict[str, tuple[float, float, int]] = {
-    "hb": (26e9, 30e9, 4001),  # high band
-    "lb": (17e9, 21e9, 4001),  # low band
+    "hb": (26e9, 36e9, 5001),  # high band
+    "lb": (16e9, 26e9, 5001),  # low band
 }
 
 
 @dataclass
 class VNAConfig:
     # Defaults match BAND_VNA_DEFAULTS["lb"], since RunConfig.band defaults to "lb".
-    start_hz: float = 17e9
-    stop_hz: float = 21e9
-    points: int = 4001
+    start_hz: float = 16e9
+    stop_hz: float = 26e9
+    points: int = 5001
     dwell_s: float = 0.0
     visa_resource: str = "TCPIP0::169.254.232.150::inst0::INSTR"
     visa_timeout_ms: float = 100000
@@ -195,7 +195,7 @@ class RunConfig:
     # BAND_VNA_DEFAULTS[band] into the VNA sweep when the band is changed.
     band: str = "lb"
 
-    uniform_board_settle_s: float = 45.0
+    uniform_board_settle_s: float = 60.0
     single_pixel_settle_s: float = 0.2
 
     # Only relevant when uniform_board_mode=True. False (default): send the grid once

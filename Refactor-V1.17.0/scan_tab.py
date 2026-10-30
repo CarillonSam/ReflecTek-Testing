@@ -22,7 +22,8 @@ import logging
 import queue
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
@@ -35,6 +36,7 @@ from run_scan import (CANCEL_RETURN_HOME, CANCEL_STAY, MEASURE_ANYWAY, Automated
 from settings_tab import SettingsTab
 from pi_controller import PiBoardController
 from pixel_controller import PixelController
+from resume import load_resume_plan
 from stage import GrblXY, HexGridPlanner, ScanPoint, emergency_reset_port
 
 # Manual moves outside the box around every scan point, plus this margin, need confirming.
@@ -209,6 +211,8 @@ class ScanTab(ttk.Frame):
         frame.pack(side="bottom", fill="x")
         self.start_button = ttk.Button(frame, text="Start Scan", command=self._on_start)
         self.start_button.pack(side="left", padx=4)
+        self.resume_button = ttk.Button(frame, text="Resume Scan...", command=self._on_resume)
+        self.resume_button.pack(side="left", padx=4)
         self.stop_button = ttk.Button(frame, text="Cancel Scan", command=self._on_stop, state="disabled")
         self.stop_button.pack(side="left", padx=4)
         self.status_label = ttk.Label(frame, text="Idle")
@@ -651,6 +655,7 @@ class ScanTab(ttk.Frame):
         self._manual_busy = True
         self._set_manual_enabled(False)
         self.start_button.configure(state="disabled")
+        self.resume_button.configure(state="disabled")
         status_label.configure(text=message, foreground="")
 
         def worker():
@@ -680,6 +685,7 @@ class ScanTab(ttk.Frame):
         self._set_manual_enabled(True)
         if not self.emergency_stopped and (self._scan_thread is None or not self._scan_thread.is_alive()):
             self.start_button.configure(state="normal")
+            self.resume_button.configure(state="normal")
 
     # ---------------------------------------------------------------- emergency stop ----
 
@@ -718,6 +724,7 @@ class ScanTab(ttk.Frame):
 
         self._set_manual_enabled(False)
         self.start_button.configure(state="disabled")
+        self.resume_button.configure(state="disabled")
         self.motor_status.configure(text=ESTOP_STATUS, foreground="#B3261E")
         self.status_label.configure(text="Emergency stopped: restart the software")
         detail = ("Reset sent to " + " and ".join(reached) + ".") if reached else ""
@@ -728,30 +735,77 @@ class ScanTab(ttk.Frame):
 
     # ---------------------------------------------------------------- scan control ----
 
-    def _on_start(self) -> None:
+    def _can_start(self) -> bool:
         if self._scan_thread is not None and self._scan_thread.is_alive():
-            return
+            return False
         if self.emergency_stopped:
             messagebox.showerror("Emergency stop", EMERGENCY_INSTRUCTIONS)
-            return
+            return False
         if self._manual_busy:
             messagebox.showerror("Stage busy", "Wait for the manual move to finish before starting a scan.")
+            return False
+        return True
+
+    def _on_start(self) -> None:
+        if not self._can_start():
             return
         try:
             config = self.settings_tab.get_config()
         except ValueError as e:
             messagebox.showerror("Invalid settings", f"Fix these before starting a scan:\n\n{e}")
             return
+        self._launch(config)
 
+    def _on_resume(self) -> None:
+        """Picks a run folder that stopped before finishing, shows what's left, and carries on
+        from there with the run's own settings (see resume.py)."""
+        if not self._can_start():
+            return
+        try:
+            current = self.settings_tab.get_config(require_save=False)
+        except ValueError as e:
+            messagebox.showerror("Invalid settings", f"Fix these before resuming a scan:\n\n{e}")
+            return
+        start_dir = Path(current.save.output_dir)
+        folder = filedialog.askdirectory(title="Choose the run folder to resume",
+                                         initialdir=str(start_dir) if start_dir.is_dir() else None)
+        if not folder:
+            return
+        try:
+            plan = load_resume_plan(folder, current)
+        except ValueError as e:
+            messagebox.showerror("Can't resume this folder", str(e))
+            return
+        if not messagebox.askokcancel("Resume scan", (
+                f"{plan.describe()}\n\n"
+                "The rest is measured with the run's own settings (grid, voltages, VNA sweep, stage calibration"
+                f"{', pattern' if plan.config.scan_type == 'pattern' else ''}). Only the connection settings "
+                "and the stage's motion settings come from the Settings tab.\n\n"
+                "The stage's current position is taken as the run's origin. Before continuing, make sure the "
+                "probe is centred on the first L element, as it was when the run started; if it isn't, line it "
+                "up with the nudge buttons first."), icon="warning", default="cancel"):
+            return
+        self._launch(plan.config, plan)
+
+    def _launch(self, config, resume=None) -> None:
+        """Starts a scan (or resumes one) on the worker thread."""
         planner = HexGridPlanner(config.geometry)
         self._set_points(planner.all_points(), config.geometry.spacing_mm, config.geometry.density_mode,
                          planner.border_points())
         self._scan_type = config.scan_type
-        self.progress_var.set(0.0)
-        self.progress_label.configure(text="0%")
+        pct = 0.0
+        if resume is not None:
+            nxt = resume.next_measurement()
+            for p in resume.points:   # what's already measured at the voltage being resumed
+                if nxt is not None and resume.is_done(p, nxt[0]):
+                    self._mark_scanned(p)
+            pct = 100.0 * resume.done / resume.total
+        self.progress_var.set(pct)
+        self.progress_label.configure(text=f"{pct:.0f}%")
         self.voltage_label.configure(text="")
-        self.status_label.configure(text="Running...")
+        self.status_label.configure(text=f"Resuming {resume.folder.name}..." if resume is not None else "Running...")
         self.start_button.configure(state="disabled")
+        self.resume_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.release_manual_hardware()        # the scan opens its own connections
         self._set_manual_enabled(False)
@@ -762,7 +816,7 @@ class ScanTab(ttk.Frame):
         def worker() -> None:
             try:
                 scanner = AutomatedArrayScanner(config, on_progress=self._on_progress, cancel_event=cancel_event,
-                                                on_move_timeout=self._ask_move_timeout)
+                                                on_move_timeout=self._ask_move_timeout, resume=resume)
                 self._scanner = scanner
                 scanner.run()
                 self._queue.put(("cancelled",) if cancel_event.is_set() else ("done", len(scanner.off_target_points)))
@@ -905,6 +959,7 @@ class ScanTab(ttk.Frame):
 
     def _finish(self) -> None:
         self.start_button.configure(state="disabled" if self.emergency_stopped else "normal")
+        self.resume_button.configure(state="disabled" if self.emergency_stopped else "normal")
         self.stop_button.configure(state="disabled")
         self._scan_thread = None
         self._cancel_event = None

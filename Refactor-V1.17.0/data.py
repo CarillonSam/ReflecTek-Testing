@@ -50,10 +50,17 @@ def point_filename(point: ScanPoint) -> str:
 class DataSaver:
     """Honors SaveConfig flags internally, so callers don't need to gate each call."""
 
-    def __init__(self, config: SaveConfig) -> None:
+    def __init__(self, config: SaveConfig, resume: bool = False) -> None:
+        """resume=True continues an existing run in this folder (see resume.py): the folder
+        must already hold that run's metadata.json, and existing files are added to, never
+        replaced. Otherwise a folder that already holds scan data is refused."""
         self.config = config
+        self.resume = resume
         self.run_dir = Path(config.output_dir) / config.run_name
-        if self.run_dir.exists() and any(
+        if resume:
+            if not (self.run_dir / "metadata.json").is_file():
+                raise FileNotFoundError(f"Can't resume: {self.run_dir} has no metadata.json.")
+        elif self.run_dir.exists() and any(
             p.suffix in (".npz", ".npy") or p.name == "metadata.json" for p in self.run_dir.iterdir()
         ):
             raise FileExistsError(
@@ -70,6 +77,18 @@ class DataSaver:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, default=str)
         return path
+
+    def record_resume(self, entry: dict[str, Any]) -> None:
+        """Resumed runs: adds entry to the "resumes" list in metadata.json, keeping everything
+        the run originally saved there."""
+        path = self.run_dir / "metadata.json"
+        with open(path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        metadata.setdefault("resumes", []).append(entry)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        os.replace(tmp, path)
 
     def save_point(
         self,
@@ -131,7 +150,8 @@ class DataSaver:
 
     # ------------------------------------------------ optional whole-run summary ----
 
-    def open_summary_arrays(self, point_count: int, voltage_count: int, vna_points: int) -> np.ndarray | None:
+    def open_summary_arrays(self, point_count: int, voltage_count: int, vna_points: int,
+                            points: list[ScanPoint] | None = None) -> np.ndarray | None:
         """
         Optional (save_summary_npz, off by default): one disk-backed array of every trace,
         shape (point_count, voltage_count, vna_points), in active-point order. It duplicates
@@ -144,6 +164,14 @@ class DataSaver:
             self.run_dir / "summary_sdata.npy", mode="w+", dtype=np.complex128,
             shape=(point_count, voltage_count, vna_points),
         )
+        if self.resume and points is not None:
+            # Rebuilt from the per-coordinate files, which are the record of what was measured.
+            for p_idx, point in enumerate(points):
+                path = self.run_dir / point_filename(point)
+                if path.exists():
+                    with np.load(path) as f:
+                        measured, sdata = f["measured"], f["sdata"]
+                        self._sdata[p_idx, measured] = sdata[measured]
         return self._sdata
 
     def finalize_summary(self, voltages_v: np.ndarray, active_points: np.ndarray,

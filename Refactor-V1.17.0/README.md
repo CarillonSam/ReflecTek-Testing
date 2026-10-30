@@ -1,8 +1,9 @@
 # Array Scan Project
 
-**Version 1.14.0.** The Scan tab's motor controls have a nudge pad (X/Y +/- by a chosen step, with
-**Origin** in the middle to go back to (0, 0)) and a **Set origin here** button. 1.13.2 added a
-one-element border around the scan grid on the plot. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
+**Version 1.17.0.** A scan that stopped before finishing (an error, a cancel, a crash) can be picked
+up where it left off with **Resume Scan...** on the Scan tab. 1.16.0 made the Scan tab pause and ask
+what to do when the stage doesn't reach a point; 1.15.0 added "Raw phase at voltage" to the Analysis tab's heatmap; 1.14.0 added a nudge pad, an
+**Origin** button and **Set origin here** to the Scan tab's motor controls. Version numbers follow MAJOR.MINOR.PATCH: breaking changes (old
 presets, data files or calibrations no longer valid) bump MAJOR, new features bump MINOR, and bug
 fixes bump PATCH.
 
@@ -336,8 +337,16 @@ load fine; those entries are ignored.
    processing run in the background with a progress bar: about 7 s for an L dataset and 14 s for H.
    The line under the folder shows what was found, e.g. "1024 L elements, 6 voltages, 17-21 GHz".
 2. **Heatmap:** every element at its physical position, coloured by phase range across voltage,
-   phase at the last voltage (what the original script plotted), or magnitude range, at one of the
-   reference frequencies. Elements without enough measured voltages show grey.
+   raw phase at a chosen voltage, or magnitude range, at one of the reference frequencies.
+   Elements without enough measured voltages show grey.
+   - **Raw phase at voltage** (V1.15.0; replaces "Phase at last voltage"): pick the voltage in the
+     dropdown after the frequency, which lists every voltage measured in the dataset and starts at
+     the last one. The phase is the corrected response's own phase (time-gated, or surface-calibrated),
+     with no phase reference subtracted, wrapped to -180..180 on a fixed -180..180 colour scale, as
+     with a pattern run's "Phase, no reference". Elements not measured at that voltage show grey;
+     readings within 0.5 mV count as the same voltage. The chosen voltage is marked with a dashed
+     line on the element's phase and magnitude vs voltage plots. The dropdown is greyed out for the
+     other options and for voltage pattern runs.
 3. **Element plots:** click an element on the heatmap, or enter its row and column (0-indexed, as
    in the file names; plus L/H if the folder has both) and press **Show**. The right side shows the
    original script's 2x2 figure: phase and magnitude vs voltage at each reference frequency, and vs
@@ -416,6 +425,55 @@ resolution is 2 um). Time gating on the same data is off by up to 16 deg, becaus
 multiple reflections arrive too close in time to the element's response to gate out. Also tested:
 a `--band 18 20` calibration, a partial calibration folder, a calibration folder from a different
 run, a folder that isn't calibration output, and a voltage pattern run.
+
+## Resuming a stopped scan (V1.17.0)
+
+**Resume Scan...**, next to **Start Scan**, carries on a run that stopped before it finished, in
+the same folder, as if it had never stopped. Use it after any stop: an error such as
+"[WinError 5] Access is denied" (usually a COM port another program, or a leftover connection,
+still has open), **Cancel Scan**, "Cancel scan" in the move-timeout question, or the program
+closing mid-scan.
+
+1. Fix whatever stopped the scan. If that meant changing a port or another connection setting,
+   change it in the Settings tab as usual.
+2. Make sure the probe is centred on the first L element, the run's origin, as it was when the run
+   started: the stage connection takes wherever the stage is when it connects as (0, 0), so a
+   resumed scan measures relative to wherever the stage is when you click OK. After an error the
+   stage usually went back there by itself (`return_home`); if it didn't, or you aren't sure, line
+   it up with the nudge buttons.
+3. Click **Resume Scan...** and choose the run folder. The confirmation says how much is done and
+   where the scan resumes, e.g. "Sweep run 2026-10-28_A: 1847 of 3072 measurements done, 1225 to
+   go. Resumes at voltage 2/3 (2.5 V), L row 7, column 12." Click **OK** to carry on.
+
+**What is measured, and with which settings.** Each element's file records which voltages were
+measured there (`measured`), and files are written atomically, so the files themselves are the
+record of what's done: every measurement in them is kept, and only the missing ones are taken, in
+the original order. Voltage steps that were already finished are skipped entirely (the board isn't
+even programmed for them); the step that was interrupted is programmed and settled again, since the
+board's state after the stop is unknown. Pattern runs reprogram the pattern from the copy saved in
+the run folder (`voltage_pattern_source.csv`), so later edits to the original CSV don't matter.
+
+The rest of the run uses the run's own settings, from its `metadata.json`: grid, voltages, VNA
+sweep, stage calibration coefficients (even if the stage has been recalibrated since), pattern,
+board voltage limits, pinout and addressing, settle times, save options and `return_home`. Only
+these come from the current Settings tab, since they don't change what is measured and may be
+what was changed to fix the problem: the connection settings for the stage, board controller and
+VNA (ports, addresses, timeouts) and the stage's motion settings (feed, settle, tolerance, move
+timeouts). A run folder that has been moved or renamed still resumes, in its new place.
+
+`metadata.json` keeps everything it was saved with when the run started, and gets a `resumes` list
+with an entry per resume: when, how much was already done, where it resumed, and the settings taken
+from the Settings tab (without passwords). A run can be resumed as many times as needed. The
+optional summary array (`save_summary_npz`) is rebuilt from the element files.
+
+**What is refused**, with the reason, before anything moves: a folder without `metadata.json`, a
+run that's already complete, a dry run, a run saved without per-element files
+(`save_individual_npz` off), a pattern run whose pattern copy is missing, element files that
+disagree with the run's settings, and, once connected, a VNA whose sweep doesn't match the saved
+frequency axis (nothing is measured or written in that case).
+
+**Start Scan** still refuses a folder that already holds scan data: only **Resume Scan...** adds to
+an existing run.
 
 ## Manual controls on the Scan tab (V1.11.0)
 
@@ -629,6 +687,23 @@ first L element: the coefficients come back to about 2e-6.
 
 **To calibrate:** use **Calibrate...** at the bottom of the Settings tab; see "Calibration
 walkthrough" above.
+
+**When a scan's move times out (V1.16.0).** If the stage doesn't reach a point in time during a scan
+started from the Scan tab, the scan pauses with the stage wherever it stopped and asks:
+
+- **Measure point anyway and continue:** measures there and carries on. The point is logged as a
+  warning with where it was actually measured, and the finished status counts the points measured
+  off target.
+- **Cancel scan and return home:** stops the scan and sends the stage to the origin (0, 0), even if
+  `return_home` is off.
+- **Cancel scan and stay here:** stops the scan and leaves the stage where it stopped, even if
+  `return_home` is on. Closing the question window does the same.
+
+The question shows which element was missed, its target and the last position read. It isn't modal,
+so the red **STOP** stays usable while it's open (STOP answers it as "stay"); the scan's own Stop
+button is greyed out until it's answered. Running `run_scan.py` directly keeps the old behaviour: the
+timeout ends the scan with an error. Note that after "stay here", the stage is no longer at the
+origin, so the next connection (the manual controls or a new scan) takes that spot as (0, 0).
 
 **Move timeouts and stage coordinates (fixed in V1.4.8).** Two bugs made calibration fail with
 "Stage did not reach target" while the stage was still moving:

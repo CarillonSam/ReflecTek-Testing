@@ -207,3 +207,29 @@ class RunConfig:
     def __post_init__(self) -> None:
         if self.pi.active_band != self.band:
             self.pi = replace(self.pi, active_band=self.band)
+
+
+def config_from_dict(cls, d: dict):
+    """
+    Rebuilds a config dataclass (e.g. RunConfig) from the plain dict a run saved in its
+    metadata.json (dataclasses.asdict, written with default=str): nested sections become
+    their dataclasses again, path strings become Paths and lists become tuples where the
+    field is a tuple. Keys this version doesn't know are ignored; missing ones keep their
+    defaults, so metadata from older versions still loads.
+    """
+    from dataclasses import MISSING, fields, is_dataclass
+    kwargs = {}
+    for f in fields(cls):
+        if f.name not in d:
+            continue
+        value = d[f.name]
+        default = f.default_factory() if f.default_factory is not MISSING else f.default
+        hint = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", str(f.type))
+        if is_dataclass(default) and isinstance(value, dict):
+            value = config_from_dict(type(default), value)
+        elif value is not None and "Path" in hint:
+            value = Path(value)
+        elif isinstance(value, list) and hint.startswith("tuple"):
+            value = tuple(value)
+        kwargs[f.name] = value
+    return cls(**kwargs)

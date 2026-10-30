@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
 
@@ -24,6 +24,9 @@ from pi_controller import PiBoardController
 from pixel_controller import NullComm, PixelController
 from stage import HexGridPlanner, MotorStage, ScanPoint, GrblXY, StageCalibration
 from vna import VNAController, VNAResult
+
+if TYPE_CHECKING:
+    from resume import ResumePlan
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -65,6 +68,7 @@ class AutomatedArrayScanner:
         on_progress: Optional[Callable[[ProgressEvent], None]] = None,
         cancel_event: Optional[threading.Event] = None,
         on_move_timeout: Optional[Callable[[ScanPoint, tuple[float, float] | None, TimeoutError], str]] = None,
+        resume: Optional["ResumePlan"] = None,
     ) -> None:
         """
         on_progress(event) is called after each point is measured — event.step /
@@ -78,6 +82,10 @@ class AutomatedArrayScanner:
         or CANCEL_STAY (stop the scan, raising ScanCancelled; the stage is sent to the origin or
         left where it is, whatever return_home says). Without it, the timeout ends the scan as an
         error, as before.
+
+        resume (from resume.load_resume_plan, with config=resume.config) continues that run in
+        its own folder: measurements already saved are skipped, the run's original stage
+        calibration is used, and the VNA must give the same frequency axis as the saved data.
         """
         self.config = config
         self.on_progress = on_progress
@@ -99,7 +107,8 @@ class AutomatedArrayScanner:
         self.stage: Optional[MotorStage] = None
         self.array: Optional[BoardController] = None
         self.vna: Optional[VNAController] = None
-        self.saver = DataSaver(config.save)
+        self.resume = resume
+        self.saver = DataSaver(config.save, resume=resume is not None)
 
     def connect(self) -> None:
         if self.config.dry_run:
@@ -120,6 +129,19 @@ class AutomatedArrayScanner:
             raise RuntimeError(f"Board controller ping NACK: {ping.get('status_name')}")
 
         self.vna.initialize()
+        if self.resume is not None:
+            self.stage.calibration = self.resume.calibration   # what the run's first part used
+
+    def _start_resume(self, frequencies_hz: np.ndarray) -> None:
+        """Resumed runs: checks the VNA matches the saved data, then notes the resume in metadata.json."""
+        saved = self.resume.frequencies_hz
+        if saved is not None and (len(saved) != len(frequencies_hz) or
+                                  not np.allclose(saved, frequencies_hz, rtol=1e-9, atol=0)):
+            raise RuntimeError(
+                f"The VNA's sweep ({frequencies_hz[0] / 1e9:g}-{frequencies_hz[-1] / 1e9:g} GHz, "
+                f"{len(frequencies_hz)} points) doesn't match the run's saved data "
+                f"({saved[0] / 1e9:g}-{saved[-1] / 1e9:g} GHz, {len(saved)} points), so the run can't be resumed with it.")
+        self.saver.record_resume(self.resume.metadata_entry())
 
     def close(self) -> None:
         if self.config.dry_run:
@@ -249,7 +271,9 @@ class AutomatedArrayScanner:
         """Copies the pattern CSV into the run folder, plus, after programming, the voltage
         every element of the board was actually set to, next to what the CSV asked for."""
         run_dir = self.saver.run_dir
-        shutil.copy(self.config.pattern_csv, run_dir / "voltage_pattern_source.csv")
+        source, copy = Path(self.config.pattern_csv), run_dir / "voltage_pattern_source.csv"
+        if not (copy.exists() and source.resolve() == copy.resolve()):   # resumed runs use the copy itself
+            shutil.copy(source, copy)
         pinout = getattr(self.applied_by, "pinout", None)
         with open(run_dir / "voltage_pattern_applied.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -268,13 +292,16 @@ class AutomatedArrayScanner:
 
     def _run_pattern(self, frequencies_hz: np.ndarray, calibration: StageCalibration) -> bool:
         """Pattern scan body: program once, measure each point once. Returns True if completed."""
-        self.program_pattern()
+        self.program_pattern()   # resumed too: the board's state after the stop is unknown
         self._save_pattern_files()
         total = len(self.active_points)
+        done_before = self.resume.done if self.resume is not None else 0
         for step, point in enumerate(self.active_points, start=1):
             if self.cancel_event is not None and self.cancel_event.is_set():
                 logging.info("Scan cancelled.")
                 return False
+            if self.resume is not None and self.resume.is_done(point, 0):
+                continue   # measured before the run stopped
             csv_v = self.pattern.voltage(point.density, point.logical_row, point.logical_col)
             v = self.applied_voltage(point.density, point.logical_row, point.logical_col)
             if np.isnan(v):
@@ -292,8 +319,9 @@ class AutomatedArrayScanner:
                        "element": np.str_(element_label(point.density, point.logical_row, point.logical_col)),
                        "pattern_csv_v": np.float64(csv_v)},   # e holds the voltage actually applied
             )
+            done_before += 1
             if self.on_progress:
-                self.on_progress(ProgressEvent(step=step, total_steps=total, point=point,
+                self.on_progress(ProgressEvent(step=done_before, total_steps=total, point=point,
                                                voltage_index=0, voltage_count=1, voltage_v=v))
         return True
 
@@ -304,7 +332,7 @@ class AutomatedArrayScanner:
         voltage_count = len(voltages_v)
         point_count = len(self.active_points)
         total_steps = voltage_count * point_count
-        step = 0
+        step = self.resume.done if self.resume is not None else 0
         cancelled = False
 
         try:
@@ -313,25 +341,31 @@ class AutomatedArrayScanner:
             # confirmed and the calibration is the one the stage actually loaded.
             frequencies_hz = self._frequencies_hz()
             calibration = self._calibration()
-            self.saver.save_metadata({
-                "config": asdict(self.config),
-                "scan_mode": "uniform_board" if self.config.uniform_board_mode else "mapped_element",
-                "density_mode": self.config.geometry.density_mode,
-                "voltages_v": voltages_v.tolist(),
-                "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
-                                   "points": int(len(frequencies_hz)), "spacing": "linear"},
-                "stage_calibration": {"source_file": self.config.stage.calibration_file,
-                                      "coefficients": calibration.to_dict()},
-                "file_layout": "one <density>_R<row>_C<col>.npz per coordinate; see data.py",
-                "active_point_count": point_count,
-                "active_points": [point.__dict__ for point in self.active_points],
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            })
-            sdata_summary = self.saver.open_summary_arrays(point_count, voltage_count, len(frequencies_hz))
+            if self.resume is not None:
+                self._start_resume(frequencies_hz)
+            else:
+                self.saver.save_metadata({
+                    "config": asdict(self.config),
+                    "scan_mode": "uniform_board" if self.config.uniform_board_mode else "mapped_element",
+                    "density_mode": self.config.geometry.density_mode,
+                    "voltages_v": voltages_v.tolist(),
+                    "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
+                                       "points": int(len(frequencies_hz)), "spacing": "linear"},
+                    "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                          "coefficients": calibration.to_dict()},
+                    "file_layout": "one <density>_R<row>_C<col>.npz per coordinate; see data.py",
+                    "active_point_count": point_count,
+                    "active_points": [point.__dict__ for point in self.active_points],
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            sdata_summary = self.saver.open_summary_arrays(point_count, voltage_count, len(frequencies_hz),
+                                                           points=self.active_points)
 
             for v_idx, voltage_v in enumerate(self.config.voltages_v):
                 if cancelled:
                     break
+                if self.resume is not None and self.resume.voltage_done(v_idx):
+                    continue   # finished before the run stopped: not even programmed
                 logging.info("Voltage step %d/%d: %.3f V", v_idx + 1, voltage_count, voltage_v)
 
                 settle_per_point = self.config.uniform_board_mode and self.config.uniform_board_settle_per_point
@@ -343,6 +377,8 @@ class AutomatedArrayScanner:
                         logging.info("Scan cancelled.")
                         cancelled = True
                         break
+                    if self.resume is not None and self.resume.is_done(point, v_idx):
+                        continue   # measured before the run stopped
 
                     logging.info(
                         "Point %d/%d | %s row=%d col=%d | x=%.3f mm y=%.3f mm",
@@ -390,23 +426,26 @@ class AutomatedArrayScanner:
             self.connect()
             frequencies_hz = self._frequencies_hz()
             calibration = self._calibration()
-            self.saver.save_metadata({
-                "config": asdict(self.config),
-                "scan_mode": "voltage_pattern",
-                "density_mode": self.config.geometry.density_mode,
-                "pattern": {"source_file": str(self.config.pattern_csv), "layout": self.pattern.layout,
-                            "summary": self.pattern.describe(),
-                            "copied_to": ["voltage_pattern_source.csv", "voltage_pattern_applied.csv"]},
-                "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
-                                   "points": int(len(frequencies_hz)), "spacing": "linear"},
-                "stage_calibration": {"source_file": self.config.stage.calibration_file,
-                                      "coefficients": calibration.to_dict()},
-                "file_layout": "one <density>_R<row>_C<col>.npz per coordinate, one measurement each "
-                               "(e = that element's pattern voltage); see data.py",
-                "active_point_count": len(self.active_points),
-                "active_points": [point.__dict__ for point in self.active_points],
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            if self.resume is not None:
+                self._start_resume(frequencies_hz)
+            else:
+                self.saver.save_metadata({
+                    "config": asdict(self.config),
+                    "scan_mode": "voltage_pattern",
+                    "density_mode": self.config.geometry.density_mode,
+                    "pattern": {"source_file": str(self.config.pattern_csv), "layout": self.pattern.layout,
+                                "summary": self.pattern.describe(),
+                                "copied_to": ["voltage_pattern_source.csv", "voltage_pattern_applied.csv"]},
+                    "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
+                                       "points": int(len(frequencies_hz)), "spacing": "linear"},
+                    "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                          "coefficients": calibration.to_dict()},
+                    "file_layout": "one <density>_R<row>_C<col>.npz per coordinate, one measurement each "
+                                   "(e = that element's pattern voltage); see data.py",
+                    "active_point_count": len(self.active_points),
+                    "active_points": [point.__dict__ for point in self.active_points],
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
             self._run_pattern(frequencies_hz, calibration)
         finally:
             self.close()

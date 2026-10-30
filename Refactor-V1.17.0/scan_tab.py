@@ -683,7 +683,8 @@ class ScanTab(ttk.Frame):
         if self._manual_busy:      # done() chained another action (e.g. the move after reading the position)
             return
         self._set_manual_enabled(True)
-        if not self.emergency_stopped and (self._scan_thread is None or not self._scan_thread.is_alive()):
+        if (not self.emergency_stopped and not getattr(self, "_checking_resume", False)
+                and (self._scan_thread is None or not self._scan_thread.is_alive())):
             self.start_button.configure(state="normal")
             self.resume_button.configure(state="normal")
 
@@ -738,6 +739,8 @@ class ScanTab(ttk.Frame):
     def _can_start(self) -> bool:
         if self._scan_thread is not None and self._scan_thread.is_alive():
             return False
+        if getattr(self, "_checking_resume", False):
+            return False
         if self.emergency_stopped:
             messagebox.showerror("Emergency stop", EMERGENCY_INSTRUCTIONS)
             return False
@@ -771,11 +774,43 @@ class ScanTab(ttk.Frame):
                                          initialdir=str(start_dir) if start_dir.is_dir() else None)
         if not folder:
             return
+        # Runs in the background so the window stays responsive even on slow storage (it opens
+        # only a couple of element files, but a network drive or antivirus can still be slow).
+        self._checking_resume = True
+        self.start_button.configure(state="disabled")
+        self.resume_button.configure(state="disabled")
+        self.status_label.configure(text=f"Checking {Path(folder).name}...")
+        results: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                plan = load_resume_plan(folder, current)
+                results.put(("ok", plan))
+            except Exception as e:   # ValueError = can't resume; anything else is unexpected, but reported too
+                results.put(("error", e))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_resume_check, results, Path(folder).name)
+
+    def _poll_resume_check(self, results: queue.Queue, name: str) -> None:
+        outcome = None
         try:
-            plan = load_resume_plan(folder, current)
-        except ValueError as e:
-            messagebox.showerror("Can't resume this folder", str(e))
+            while True:
+                outcome = results.get_nowait()
+        except queue.Empty:
+            pass
+        if outcome is None:
+            self.after(100, self._poll_resume_check, results, name)
             return
+        self._checking_resume = False
+        self.start_button.configure(state="disabled" if self.emergency_stopped else "normal")
+        self.resume_button.configure(state="disabled" if self.emergency_stopped else "normal")
+        self.status_label.configure(text="Idle")
+        if outcome[0] == "error":
+            e = outcome[1]
+            messagebox.showerror("Can't resume this folder",
+                                 str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}")
+            return
+        plan = outcome[1]
         if not messagebox.askokcancel("Resume scan", (
                 f"{plan.describe()}\n\n"
                 "The rest is measured with the run's own settings (grid, voltages, VNA sweep, stage calibration"
@@ -785,7 +820,8 @@ class ScanTab(ttk.Frame):
                 "probe is centred on the first L element, as it was when the run started; if it isn't, line it "
                 "up with the nudge buttons first."), icon="warning", default="cancel"):
             return
-        self._launch(plan.config, plan)
+        if self._can_start():   # things may have changed while the dialog was open (STOP, a manual move)
+            self._launch(plan.config, plan)
 
     def _launch(self, config, resume=None) -> None:
         """Starts a scan (or resumes one) on the worker thread."""

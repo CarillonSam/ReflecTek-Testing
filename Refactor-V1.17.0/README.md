@@ -441,14 +441,26 @@ closing mid-scan.
    resumed scan measures relative to wherever the stage is when you click OK. After an error the
    stage usually went back there by itself (`return_home`); if it didn't, or you aren't sure, line
    it up with the nudge buttons.
-3. Click **Resume Scan...** and choose the run folder. The confirmation says how much is done and
+3. Click **Resume Scan...** and choose the run folder. It's checked in the background (normally
+   a fraction of a second, see below), then the confirmation says how much is done and
    where the scan resumes, e.g. "Sweep run 2026-10-28_A: 1847 of 3072 measurements done, 1225 to
    go. Resumes at voltage 2/3 (2.5 V), L row 7, column 12." Click **OK** to carry on.
 
-**What is measured, and with which settings.** Each element's file records which voltages were
-measured there (`measured`), and files are written atomically, so the files themselves are the
-record of what's done: every measurement in them is kept, and only the missing ones are taken, in
-the original order. Voltage steps that were already finished are skipped entirely (the board isn't
+**What is measured, and with which settings.** A scan measures in a fixed order (each voltage
+step in turn, the elements in the same order within each), saves each measurement before taking
+the next, and a resume carries on in that order. So the measurements done are always one unbroken
+stretch from the start, and resuming means finding where it ends. That's found without opening the
+element files one by one: the folder listing gives each file's last-modified time, the newest file
+is the element measured last, and opening that one file says which voltage step it was in. The
+guess is confirmed by opening the file of the next measurement (the one before must be saved and
+this one not, which can only be true at the real resume point). If the modified times can't be
+trusted (a folder copied with a tool that doesn't keep them, or times tied on a FAT32 drive's
+2-second clock), the confirmation fails and the point is found by halving instead, about 13 file
+opens for a 6144-measurement run. Either way the result is exact: 2 files are opened normally, and
+a full 32 x 32, 6-voltage run checks in well under a second even where antivirus scans every
+`.npz` as it's opened. Every measurement already saved is kept, and only the rest are taken. This
+relies on the stretch being unbroken, which the program always keeps true; an element file deleted
+or moved by hand partway through the run would not be noticed. Voltage steps that were already finished are skipped entirely (the board isn't
 even programmed for them); the step that was interrupted is programmed and settled again, since the
 board's state after the stop is unknown. Pattern runs reprogram the pattern from the copy saved in
 the run folder (`voltage_pattern_source.csv`), so later edits to the original CSV don't matter.

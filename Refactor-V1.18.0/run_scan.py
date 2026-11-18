@@ -1,0 +1,620 @@
+"""
+Coordinator: wires the motor stage, board voltage controller, VNA, and data
+handlers together and runs the scan. Run this file directly to start a scan.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import shutil
+import threading
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Optional
+
+import numpy as np
+
+from config import PixelControllerConfig, RunConfig, SaveConfig, StageConfig
+from controller import BoardController
+from data import DataSaver
+from pattern import VoltagePattern, element_label, load_pattern
+from pi_controller import PiBoardController
+from pixel_controller import NullComm, PixelController
+from stage import HexGridPlanner, MotorStage, ScanPoint, GrblXY, StageCalibration
+from vna import VNAController, VNAResult
+
+if TYPE_CHECKING:
+    from resume import ResumePlan
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    step: int
+    total_steps: int
+    point: ScanPoint
+    voltage_index: int
+    voltage_count: int
+    voltage_v: float
+
+
+class ScanCancelled(Exception):
+    """The operator cancelled the scan from the move-timeout dialog (not an error)."""
+
+
+# What on_move_timeout can answer when the stage doesn't reach a point in time.
+MEASURE_ANYWAY, CANCEL_RETURN_HOME, CANCEL_STAY = "measure", "home", "stay"
+
+
+class AutomatedArrayScanner:
+    """
+    Coordinates four handlers to run a scan:
+      - stage: MotorStage       (currently GrblXY)
+      - array: BoardController  (currently PixelController or PiBoardController)
+      - vna:   VNAController
+      - saver: DataSaver
+    All this class does with voltages is build a (cols, rows) grid matching the hex
+    grid geometry and hand the whole thing to the controller — it has no idea how any
+    controller addresses hardware. To use different hardware, construct a different
+    MotorStage / BoardController implementation in connect() below.
+    """
+
+    def __init__(
+        self,
+        config: RunConfig,
+        on_progress: Optional[Callable[[ProgressEvent], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        on_move_timeout: Optional[Callable[[ScanPoint, tuple[float, float] | None, TimeoutError], str]] = None,
+        resume: Optional["ResumePlan"] = None,
+    ) -> None:
+        """
+        on_progress(event) is called after each point is measured — event.step /
+        event.total_steps covers the whole run (all voltages x all points), so it's a
+        direct progress fraction. cancel_event, if set mid-run, stops the scan cleanly
+        after the current point (hardware still gets homed/closed via close()).
+
+        on_move_timeout(point, last_read, error), if given, is asked what to do when the stage
+        doesn't reach a point in time (last_read: where it was, plot coordinates, or None if
+        unreadable). It answers MEASURE_ANYWAY (measure there and carry on), CANCEL_RETURN_HOME
+        or CANCEL_STAY (stop the scan, raising ScanCancelled; the stage is sent to the origin or
+        left where it is, whatever return_home says). Without it, the timeout ends the scan as an
+        error, as before.
+
+        resume (from resume.load_resume_plan, with config=resume.config) continues that run in
+        its own folder: measurements already saved are skipped, the run's original stage
+        calibration is used, and the VNA must give the same frequency axis as the saved data.
+        """
+        self.config = config
+        self.on_progress = on_progress
+        self.cancel_event = cancel_event
+        self.on_move_timeout = on_move_timeout
+        self.return_home_override: Optional[bool] = None   # set by the move-timeout answer
+        self.off_target_points: list[ScanPoint] = []        # measured anyway after a timeout
+        if config.scan_type == "transient":
+            t = config.transient
+            if not len(t.voltages_v) or t.hold_s <= 0 or t.ifbw_hz <= 0:
+                raise ValueError("A transient scan needs at least one voltage, a hold time above 0 and an IF bandwidth above 0.")
+            if t.estimated_points() > t.max_points:
+                raise ValueError(f"The {t.duration_s:g} s profile needs about {t.estimated_points()} points at "
+                                 f"{t.ifbw_hz:g} Hz IF bandwidth, more than the VNA's {t.max_points}.")
+        self.scan_plan = HexGridPlanner(config.geometry)
+        self.active_points = self.scan_plan.active_points()
+        row_count = config.geometry.rows if config.geometry.density_mode == "L" else config.geometry.rows * 2
+        self.grid_shape = (config.geometry.cols, row_count)
+        # Pattern scans: read and check the CSV now, before any hardware is touched.
+        self.pattern: Optional[VoltagePattern] = None
+        if config.scan_type == "pattern":
+            if config.pattern_csv is None:
+                raise ValueError("Voltage pattern scan selected, but no pattern CSV is set.")
+            self.pattern = load_pattern(config.pattern_csv, config.geometry,
+                                        config.pixels.min_voltage_v, config.pixels.max_voltage_v)
+        self.stage: Optional[MotorStage] = None
+        self.array: Optional[BoardController] = None
+        self.vna: Optional[VNAController] = None
+        self.resume = resume
+        self.saver = DataSaver(config.save, resume=resume is not None)
+
+    def connect(self) -> None:
+        if self.config.dry_run:
+            logging.info("Dry-run mode: hardware connections skipped.")
+            return
+
+        self.stage = GrblXY(self.config.stage)
+        self.array = (
+            PiBoardController(self.config.pi) if self.config.controller_type == "pi"
+            else PixelController(self.config.pixels, self.config.geometry.density_mode)
+        )
+        self.vna = VNAController(self.config.vna)
+
+        ping = self.array.ping()
+        if ping.get("error"):
+            raise RuntimeError(f"Board controller ping failed: {ping['error']}")
+        if not ping.get("ok", False):
+            raise RuntimeError(f"Board controller ping NACK: {ping.get('status_name')}")
+
+        if self.config.scan_type == "transient":
+            self.vna.setup_cw(self.config.transient)   # CW capture instead of a frequency sweep
+        else:
+            self.vna.initialize()
+        if self.resume is not None:
+            self.stage.calibration = self.resume.calibration   # what the run's first part used
+
+    def _start_resume(self, frequencies_hz: np.ndarray) -> None:
+        """Resumed runs: checks the VNA matches the saved data, then notes the resume in metadata.json."""
+        saved = self.resume.frequencies_hz
+        if saved is not None and (len(saved) != len(frequencies_hz) or
+                                  not np.allclose(saved, frequencies_hz, rtol=1e-9, atol=0)):
+            raise RuntimeError(
+                f"The VNA's sweep ({frequencies_hz[0] / 1e9:g}-{frequencies_hz[-1] / 1e9:g} GHz, "
+                f"{len(frequencies_hz)} points) doesn't match the run's saved data "
+                f"({saved[0] / 1e9:g}-{saved[-1] / 1e9:g} GHz, {len(saved)} points), so the run can't be resumed with it.")
+        self.saver.record_resume(self.resume.metadata_entry())
+
+    def close(self) -> None:
+        if self.config.dry_run:
+            return
+        try:
+            home = self.config.return_home if self.return_home_override is None else self.return_home_override
+            if home and self.stage is not None:
+                self.stage.home_xy()
+        finally:
+            for device in (self.vna, self.array, self.stage):
+                if device is not None:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+
+    def _uniform_grid(self, voltage_v: float) -> np.ndarray:
+        return np.full(self.grid_shape, voltage_v, dtype=float)
+
+    def _single_point_grid(self, point: ScanPoint, voltage_v: float) -> np.ndarray:
+        """Every element at 0 V except this point's. The controller addresses that element
+        by its index in the pinout (pinout.py)."""
+        grid = np.zeros(self.grid_shape, dtype=float)
+        grid[point.logical_col, point.logical_row] = voltage_v
+        return grid
+
+    def program_voltage_for_scan(self, voltage_v: float) -> None:
+        if self.config.dry_run:
+            logging.info("[DRY RUN] set_voltage_grid: uniform %.3f V over %s", voltage_v, self.grid_shape)
+            return
+
+        assert self.array is not None
+        self.array.set_voltage_grid(self._uniform_grid(voltage_v))
+        time.sleep(self.config.uniform_board_settle_s)
+
+    def program_voltage_for_point(self, point: ScanPoint, voltage_v: float) -> None:
+        if self.config.dry_run:
+            logging.info(
+                "[DRY RUN] set_voltage_grid: (row=%d col=%d) -> %.3f V", point.logical_row, point.logical_col, voltage_v
+            )
+            return
+
+        assert self.array is not None
+        self.array.set_voltage_grid(self._single_point_grid(point, voltage_v))
+        time.sleep(self.config.single_pixel_settle_s)
+
+    def program_pattern(self) -> None:
+        """Sets every element to its pattern voltage, once, then waits the settle time."""
+        assert self.pattern is not None
+        if self.config.dry_run:
+            # No hardware, but run the same controller logic with the link stubbed out, so the
+            # recorded voltages are exactly what hardware would have been sent.
+            logging.info("[DRY RUN] voltage pattern: %s", self.pattern.describe())
+            self.applied_by = (PixelController(self.config.pixels, self.config.geometry.density_mode, comm=NullComm())
+                               if self.config.controller_type == "pixel" else _PiGridRecord(self.config.pi))
+            self._program(self.applied_by)
+            return
+        assert self.array is not None
+        self.applied_by = self.array
+        self._program(self.array)
+        time.sleep(self.config.uniform_board_settle_s)
+
+    def _program(self, controller) -> None:
+        if isinstance(controller, PixelController):
+            controller.apply_pattern(self.pattern.voltages)  # whole board, by pinout index
+        else:
+            # The Pi controller takes one grid for the scanned density; it can't address
+            # the other density's elements separately.
+            density = self.config.geometry.density_mode
+            others = [k for k, v in self.pattern.voltages.items() if k[0] != density and v != 0]
+            if others:
+                raise RuntimeError(
+                    f"The pattern sets {len(others)} element(s) outside the scanned density ({density}), "
+                    f"e.g. {element_label(*others[0])}; the Pi controller can only set the scanned density."
+                )
+            controller.set_voltage_grid(self.pattern.grid(density, self.config.geometry))
+
+    def applied_voltage(self, density: str, row: int, col: int) -> float:
+        """What the controller was actually told to put on this element: traced from the
+        commands it sent (after clipping and DAC resolution), not taken from the CSV."""
+        return self.applied_by.element_voltage(density, row, col)
+
+    def measure_point(self, point: ScanPoint) -> VNAResult:
+        if self.config.dry_run:
+            zeros = np.zeros(self.config.vna.points)
+            return VNAResult(sdata=zeros.astype(np.complex128), amplitude=zeros, phase_deg=zeros)
+        assert self.vna is not None
+        self._move_to_point(point)
+        return self.vna.trigger()
+
+    def _move_to_point(self, point: ScanPoint) -> None:
+        """Moves to the point and waits until it's there, asking on_move_timeout what to do if
+        it doesn't arrive in time (see __init__)."""
+        assert self.stage is not None
+        self.stage.goto_ideal_xy(point.stage_x_mm, point.stage_y_mm)
+        try:
+            self.stage.wait_until_reached_ideal(point.stage_x_mm, point.stage_y_mm)
+        except TimeoutError as e:
+            if self.on_move_timeout is None:
+                raise
+            try:
+                pos = self.stage.get_pos()
+                last_read = self.stage.calibration.inverse(pos.x_mm, pos.y_mm)
+            except Exception:
+                last_read = None
+            answer = self.on_move_timeout(point, last_read, e)
+            if answer == CANCEL_RETURN_HOME or answer == CANCEL_STAY:
+                self.return_home_override = answer == CANCEL_RETURN_HOME
+                raise ScanCancelled(answer) from e
+            if answer != MEASURE_ANYWAY:
+                raise
+            logging.warning("Stage didn't reach %s row %d col %d (x=%.3f, y=%.3f mm); measured anyway at %s.",
+                            point.density, point.logical_row, point.logical_col, point.stage_x_mm,
+                            point.stage_y_mm, "an unknown position" if last_read is None else
+                            f"x={last_read[0]:.3f}, y={last_read[1]:.3f} mm")
+            self.off_target_points.append(point)
+
+    def _frequencies_hz(self) -> np.ndarray:
+        """The VNA's actual sweep (read back in initialize()), or the configured one in a dry run."""
+        if self.vna is not None and self.vna.frequencies_hz is not None:
+            return self.vna.frequencies_hz
+        c = self.config.vna
+        return np.linspace(c.start_hz, c.stop_hz, c.points)
+
+    def _calibration(self) -> StageCalibration:
+        """The correction actually applied to moves (identity if uncalibrated)."""
+        if self.stage is not None:
+            return self.stage.calibration
+        return StageCalibration.load_or_identity(self.config.stage.calibration_file)
+
+    def _save_pattern_files(self) -> None:
+        """Copies the pattern CSV into the run folder, plus, after programming, the voltage
+        every element of the board was actually set to, next to what the CSV asked for."""
+        run_dir = self.saver.run_dir
+        source, copy = Path(self.config.pattern_csv), run_dir / "voltage_pattern_source.csv"
+        if not (copy.exists() and source.resolve() == copy.resolve()):   # resumed runs use the copy itself
+            shutil.copy(source, copy)
+        pinout = getattr(self.applied_by, "pinout", None)
+        with open(run_dir / "voltage_pattern_applied.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["element", "density", "row", "col", "controller_index",
+                             "applied_voltage_v", "csv_voltage_v"])
+            g = self.config.geometry
+            for density in ("L", "H"):
+                rows = g.rows if density == "L" else g.rows * 2
+                for r in range(rows):
+                    for c in range(g.cols):
+                        applied = self.applied_voltage(density, r, c)
+                        writer.writerow([element_label(density, r, c), density, r, c,
+                                         pinout.index(density, r, c) if pinout is not None else "",
+                                         "" if np.isnan(applied) else f"{applied:.6f}",
+                                         self.pattern.voltage(density, r, c)])
+
+    def _run_pattern(self, frequencies_hz: np.ndarray, calibration: StageCalibration) -> bool:
+        """Pattern scan body: program once, measure each point once. Returns True if completed."""
+        self.program_pattern()   # resumed too: the board's state after the stop is unknown
+        self._save_pattern_files()
+        total = len(self.active_points)
+        done_before = self.resume.done if self.resume is not None else 0
+        for step, point in enumerate(self.active_points, start=1):
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                logging.info("Scan cancelled.")
+                return False
+            if self.resume is not None and self.resume.is_done(point, 0):
+                continue   # measured before the run stopped
+            csv_v = self.pattern.voltage(point.density, point.logical_row, point.logical_col)
+            v = self.applied_voltage(point.density, point.logical_row, point.logical_col)
+            if np.isnan(v):
+                raise RuntimeError(f"The controller has no record of setting "
+                                   f"{element_label(point.density, point.logical_row, point.logical_col)}.")
+            logging.info("Point %d/%d | %s (%.4f V) | x=%.3f mm y=%.3f mm", step, total,
+                         element_label(point.density, point.logical_row, point.logical_col), v,
+                         point.stage_x_mm, point.stage_y_mm)
+            result = self.measure_point(point)
+            self.saver.save_point(
+                point=point, voltages_v=np.array([v]), voltage_index=0, sdata=result.sdata,
+                frequencies_hz=frequencies_hz,
+                physical_xy=calibration.transform(point.stage_x_mm, point.stage_y_mm),
+                extra={"scan_type": np.str_("pattern"),
+                       "element": np.str_(element_label(point.density, point.logical_row, point.logical_col)),
+                       "pattern_csv_v": np.float64(csv_v)},   # e holds the voltage actually applied
+            )
+            done_before += 1
+            if self.on_progress:
+                self.on_progress(ProgressEvent(step=done_before, total_steps=total, point=point,
+                                               voltage_index=0, voltage_count=1, voltage_v=v))
+        return True
+
+    def run(self) -> None:
+        if self.pattern is not None:
+            return self._run_pattern_scan()
+        if self.config.scan_type == "transient":
+            return self._run_transient_scan()
+        voltages_v = np.asarray(self.config.voltages_v, dtype=float)
+        voltage_count = len(voltages_v)
+        point_count = len(self.active_points)
+        total_steps = voltage_count * point_count
+        step = self.resume.done if self.resume is not None else 0
+        cancelled = False
+
+        try:
+            self.connect()
+            # Saved after connecting, so the frequency axis is what the VNA actually
+            # confirmed and the calibration is the one the stage actually loaded.
+            frequencies_hz = self._frequencies_hz()
+            calibration = self._calibration()
+            if self.resume is not None:
+                self._start_resume(frequencies_hz)
+            else:
+                self.saver.save_metadata({
+                    "config": asdict(self.config),
+                    "scan_mode": "uniform_board" if self.config.uniform_board_mode else "mapped_element",
+                    "density_mode": self.config.geometry.density_mode,
+                    "voltages_v": voltages_v.tolist(),
+                    "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
+                                       "points": int(len(frequencies_hz)), "spacing": "linear"},
+                    "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                          "coefficients": calibration.to_dict()},
+                    "file_layout": "one <density>_R<row>_C<col>.npz per coordinate; see data.py",
+                    "active_point_count": point_count,
+                    "active_points": [point.__dict__ for point in self.active_points],
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            sdata_summary = self.saver.open_summary_arrays(point_count, voltage_count, len(frequencies_hz),
+                                                           points=self.active_points)
+
+            for v_idx, voltage_v in enumerate(self.config.voltages_v):
+                if cancelled:
+                    break
+                if self.resume is not None and self.resume.voltage_done(v_idx):
+                    continue   # finished before the run stopped: not even programmed
+                logging.info("Voltage step %d/%d: %.3f V", v_idx + 1, voltage_count, voltage_v)
+
+                settle_per_point = self.config.uniform_board_mode and self.config.uniform_board_settle_per_point
+                if self.config.uniform_board_mode and not settle_per_point:
+                    self.program_voltage_for_scan(voltage_v)  # once for this whole voltage step
+
+                for p_idx, point in enumerate(self.active_points):
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        logging.info("Scan cancelled.")
+                        cancelled = True
+                        break
+                    if self.resume is not None and self.resume.is_done(point, v_idx):
+                        continue   # measured before the run stopped
+
+                    logging.info(
+                        "Point %d/%d | %s row=%d col=%d | x=%.3f mm y=%.3f mm",
+                        p_idx + 1, point_count, point.density, point.logical_row, point.logical_col,
+                        point.stage_x_mm, point.stage_y_mm,
+                    )
+
+                    if settle_per_point:
+                        self.program_voltage_for_scan(voltage_v)  # re-send + delay before this point
+                    elif not self.config.uniform_board_mode:
+                        self.program_voltage_for_point(point, voltage_v)
+
+                    result = self.measure_point(point)
+                    if sdata_summary is not None:
+                        sdata_summary[p_idx, v_idx, :] = result.sdata
+
+                    self.saver.save_point(
+                        point=point, voltages_v=voltages_v, voltage_index=v_idx,
+                        sdata=result.sdata,
+                        frequencies_hz=frequencies_hz,
+                        physical_xy=calibration.transform(point.stage_x_mm, point.stage_y_mm),
+                    )
+
+                    step += 1
+                    if self.on_progress:
+                        self.on_progress(ProgressEvent(
+                            step=step, total_steps=total_steps, point=point,
+                            voltage_index=v_idx, voltage_count=voltage_count, voltage_v=voltage_v,
+                        ))
+
+            if not cancelled:
+                active_points = np.array(
+                    [[p.logical_row, p.logical_col, p.stage_x_mm, p.stage_y_mm, p.y_loop, p.x_loop]
+                     for p in self.active_points],
+                    dtype=float,
+                )
+                self.saver.finalize_summary(voltages_v=voltages_v, active_points=active_points,
+                                            frequencies_hz=frequencies_hz)
+        finally:
+            self.close()
+
+
+    def _run_pattern_scan(self) -> None:
+        try:
+            self.connect()
+            frequencies_hz = self._frequencies_hz()
+            calibration = self._calibration()
+            if self.resume is not None:
+                self._start_resume(frequencies_hz)
+            else:
+                self.saver.save_metadata({
+                    "config": asdict(self.config),
+                    "scan_mode": "voltage_pattern",
+                    "density_mode": self.config.geometry.density_mode,
+                    "pattern": {"source_file": str(self.config.pattern_csv), "layout": self.pattern.layout,
+                                "summary": self.pattern.describe(),
+                                "copied_to": ["voltage_pattern_source.csv", "voltage_pattern_applied.csv"]},
+                    "frequencies_hz": {"start": float(frequencies_hz[0]), "stop": float(frequencies_hz[-1]),
+                                       "points": int(len(frequencies_hz)), "spacing": "linear"},
+                    "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                          "coefficients": calibration.to_dict()},
+                    "file_layout": "one <density>_R<row>_C<col>.npz per coordinate, one measurement each "
+                                   "(e = that element's pattern voltage); see data.py",
+                    "active_point_count": len(self.active_points),
+                    "active_points": [point.__dict__ for point in self.active_points],
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            self._run_pattern(frequencies_hz, calibration)
+        finally:
+            self.close()
+
+
+    # ---------------------------------------------------------------- transient scans ----
+
+    def _run_transient_scan(self) -> None:
+        t = self.config.transient
+        total = len(self.active_points)
+        done = self.resume.done if self.resume is not None else 0
+        try:
+            self.connect()
+            calibration = self._calibration()
+            capture = self._capture_plan()
+            if self.resume is not None:
+                self._start_resume(np.array([float(t.freq_hz)]))
+            else:
+                self.saver.save_metadata({
+                    "config": asdict(self.config),
+                    "scan_mode": "transient",
+                    "density_mode": self.config.geometry.density_mode,
+                    "transient": {**asdict(t), "duration_s": t.duration_s, **capture},
+                    "frequencies_hz": {"cw": float(t.freq_hz)},
+                    "stage_calibration": {"source_file": self.config.stage.calibration_file,
+                                          "coefficients": calibration.to_dict()},
+                    "file_layout": "one <density>_R<row>_C<col>.npz per coordinate, one CW capture each, "
+                                   "time axis arange(n) * dt_s from the trigger; see data.py",
+                    "active_point_count": total,
+                    "active_points": [point.__dict__ for point in self.active_points],
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            for point in self.active_points:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    logging.info("Scan cancelled.")
+                    return
+                if self.resume is not None and self.resume.is_done(point, 0):
+                    continue   # measured before the run stopped
+                if not self.config.dry_run:
+                    self._move_to_point(point)
+                arrays = self._capture_transient(point, capture)
+                physical_xy = calibration.transform(point.stage_x_mm, point.stage_y_mm)
+                self.saver.save_transient(point, arrays, physical_xy)
+                done += 1
+                if self.on_progress:
+                    self.on_progress(ProgressEvent(step=done, total_steps=total, point=point, voltage_index=0,
+                                                   voltage_count=1, voltage_v=float(t.voltages_v[-1])))
+        finally:
+            self.close()
+
+    def _capture_plan(self) -> dict:
+        """The capture's sample count and interval: the VNA's, or the estimate in a dry run."""
+        t = self.config.transient
+        if self.vna is not None:
+            v = self.vna
+            return {"points": v.cw_points, "dt_s": v.cw_dt_s, "sweep_time_s": v.cw_sweep_time_s,
+                    "dt_source": v.cw_dt_source}
+        points = t.estimated_points()
+        dt = 1.0 / t.ifbw_hz + t.sample_overhead_s
+        return {"points": points, "dt_s": dt, "sweep_time_s": points * dt, "dt_source": "estimate (dry run)"}
+
+    def _set_board(self, point: ScanPoint, voltage_v: float) -> None:
+        grid = (self._uniform_grid(voltage_v) if self.config.uniform_board_mode
+                else self._single_point_grid(point, voltage_v))
+        self.array.set_voltage_grid(grid)
+
+    def _capture_transient(self, point: ScanPoint, capture: dict) -> dict:
+        """One continuous capture at this point while the board steps through the profile.
+        Every step time is taken from the PC clock against the moment just before the trigger,
+        so the VNA's trigger latency is one constant shift for the whole capture."""
+        t = self.config.transient
+        voltages = np.asarray(t.voltages_v, dtype=float)
+        n = len(voltages)
+        planned = np.arange(n) * t.hold_s
+        sent, finished, applied = np.zeros(n), np.zeros(n), np.full(n, np.nan)
+        points, dt = capture["points"], capture["dt_s"]
+
+        if self.config.dry_run:
+            logging.info("[DRY RUN] transient at %s row %d col %d: profile %s V, %g s holds",
+                         point.density, point.logical_row, point.logical_col, list(voltages), t.hold_s)
+            s11 = np.zeros(points, dtype=np.complex128)
+            sent[:], finished[:], applied[:] = planned, planned, voltages
+            trigger_time = time.strftime("%Y-%m-%dT%H:%M:%S")
+        else:
+            self.vna.arm_cw()
+            trigger_time = time.strftime("%Y-%m-%dT%H:%M:%S")
+            t0 = self.vna.fire_cw()
+            for i, v in enumerate(voltages):
+                _wait_until(t0 + planned[i])
+                sent[i] = time.perf_counter() - t0
+                self._set_board(point, v)
+                finished[i] = time.perf_counter() - t0
+                try:
+                    applied[i] = self.array.element_voltage(point.density, point.logical_row, point.logical_col)
+                except Exception:
+                    pass
+            _wait_until(t0 + capture["sweep_time_s"] + t.read_margin_s)
+            s11 = self.vna.read_cw()
+            late = sent - planned
+            logging.info("Transient %s row %d col %d: %d steps, sent up to %.1f ms late, board returned in up to %.1f ms",
+                         point.density, point.logical_row, point.logical_col, n,
+                         1e3 * late.max(), 1e3 * (finished - sent).max())
+
+        return {
+            "s11": s11, "time_s": np.arange(points) * dt, "dt_s": np.float64(dt),
+            "sweep_time_s": np.float64(capture["sweep_time_s"]), "dt_source": np.str_(capture["dt_source"]),
+            "freq_hz": np.float64(t.freq_hz), "ifbw_hz": np.float64(t.ifbw_hz),
+            "voltages_v": voltages, "hold_s": np.float64(t.hold_s),
+            "step_planned_s": planned, "step_sent_s": sent, "step_done_s": finished, "applied_v": applied,
+            "trigger": np.str_(t.trigger), "trigger_time": np.str_(trigger_time),
+        }
+
+
+def _wait_until(deadline: float) -> None:
+    """Sleeps until time.perf_counter() reaches deadline, in short naps so it isn't late by
+    more than the OS's sleep granularity."""
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.005))
+
+
+class _PiGridRecord:
+    """Dry-run stand-in for the Pi controller: records the grid exactly as it would be written
+    to the Pi's file (clipped to the voltage range, 4 decimals), without any SSH."""
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self._grid = None
+
+    def set_voltage_grid(self, voltages: np.ndarray) -> None:
+        self._grid = np.round(np.clip(voltages, self.config.min_voltage_v, self.config.max_voltage_v).T, 4)
+
+    def element_voltage(self, density: str, row: int, col: int) -> float:
+        if self._grid is None or not (0 <= row < self._grid.shape[0] and 0 <= col < self._grid.shape[1]):
+            return float("nan")
+        return float(self._grid[row, col])
+
+
+if __name__ == "__main__":
+    # First thing to edit: output path, voltage list, run name.
+    config = RunConfig(
+        voltages_v=(0.0, 0.5, 1.0, 1.5, 2.0),
+        stage=StageConfig(port="COM10", calibration_file="stage_calibration.json"),  # run calibrate_stage.py once first
+        pixels=PixelControllerConfig(port="COM7"),
+        save=SaveConfig(
+            output_dir=Path(r"C:\Users\labuser\Gen3WGSDualPatchGraphs\AutomationTesting"),
+            run_name="2026-03-14_uniform_board_scan",
+        ),
+        uniform_board_mode=True,
+        single_pixel_settle_s=0.2,
+        dry_run=False,
+    )
+    AutomatedArrayScanner(config).run()

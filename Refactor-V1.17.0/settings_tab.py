@@ -26,7 +26,7 @@ from config import (
 )
 from config_io import load_config, save_config
 
-BAND_LABELS = {"lb": "Low band (17-21 GHz)", "hb": "High band (26-30 GHz)"}
+BAND_LABELS = {"lb": "Low band (16-26 GHz)", "hb": "High band (26-36 GHz)"}
 BAND_FROM_LABEL = {v: k for k, v in BAND_LABELS.items()}
 
 # Fields owned by the General section (or derived), so Advanced skips them.

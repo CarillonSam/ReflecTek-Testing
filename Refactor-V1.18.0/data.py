@@ -1,0 +1,229 @@
+"""
+Data handler. One .npz file per visited coordinate, plus run-level metadata.
+
+Per-coordinate files (the legacy protocol): the first time a coordinate is visited its
+file is created with every array already at its final size, (voltage_count, vna_points),
+and filled with NaN ("empty"). Every later visit at another voltage rewrites the whole
+file: everything already saved plus the slot just measured. So at any moment, including
+after a crash or a cancelled scan, each file holds every voltage measured there so far,
+and `measured` says which slots are real.
+
+Keys in each file:
+  e              (V,)    voltage applied at each slot; NaN until measured (legacy key)
+  iteration      ()      index of the voltage slot written most recently (legacy key)
+  sdata          (V, N)  raw complex S11, NaN until measured. Magnitude and phase aren't
+                         stored, since they're derivable: np.abs(sdata) and
+                         np.degrees(np.angle(sdata)).
+  measured       (V,)    True where a slot holds real data
+  measured_time  (V,)    Unix time each slot was measured; NaN until measured
+  voltages_v     (V,)    the full planned voltage list (so slot i means voltages_v[i])
+  frequencies_hz (N,)    frequency axis, from the VNA's read-back sweep settings
+  density, logical_row, logical_col   which element this is (row/col are 0-indexed,
+                                      within that density)
+  stage_x_mm, stage_y_mm              ideal (planned) position
+  physical_x_mm, physical_y_mm        position after the stage calibration correction
+  y_loop, x_loop                      full-grid row and visit index within that row
+
+Files are written to a temporary name and then renamed over the old one, so a crash
+mid-write can't corrupt a file that already holds earlier voltages.
+
+Transient runs (scan_type "transient", save_transient) write one file per element too, once,
+with the whole capture:
+  s11            (n,)    raw complex S11 at freq_hz, one sample every dt_s
+  time_s         (n,)    sample times from the trigger, exactly arange(n) * dt_s (nothing resampled)
+  dt_s, sweep_time_s     sample interval and capture length (sweep_time_s / n = dt_s)
+  dt_source              "instrument" (the VNA's reported sweep time) or an estimate, if it wouldn't say
+  freq_hz, ifbw_hz       CW frequency and IF bandwidth
+  voltages_v     (S,)    the profile, in order
+  hold_s                 the planned hold per step
+  step_planned_s (S,)    when each change was due: i * hold_s after the trigger
+  step_sent_s    (S,)    when each change was sent to the board, from the trigger (PC clock)
+  step_done_s    (S,)    when the board controller returned from it
+  applied_v      (S,)    what the controller reports this element was set to at each step
+  trigger                "usb" or "software"; trigger_time: the PC's wall-clock time at the trigger
+  measured, measured_time, iteration, frequencies_hz ([freq_hz])   so Resume treats it like a
+                                                                    one-measurement file
+  plus the element's identity and position, as above.
+Step times are measured from immediately before the trigger was sent, so the VNA's own
+trigger latency is a constant shift common to every step and every sample.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from config import SaveConfig
+from stage import ScanPoint
+
+
+def point_filename(point: ScanPoint) -> str:
+    """e.g. L_R005_C012.npz: density, then row and column within that density (0-indexed)."""
+    return f"{point.density}_R{point.logical_row:03d}_C{point.logical_col:03d}.npz"
+
+
+class DataSaver:
+    """Honors SaveConfig flags internally, so callers don't need to gate each call."""
+
+    def __init__(self, config: SaveConfig, resume: bool = False) -> None:
+        """resume=True continues an existing run in this folder (see resume.py): the folder
+        must already hold that run's metadata.json, and existing files are added to, never
+        replaced. Otherwise a folder that already holds scan data is refused."""
+        self.config = config
+        self.resume = resume
+        self.run_dir = Path(config.output_dir) / config.run_name
+        if resume:
+            if not (self.run_dir / "metadata.json").is_file():
+                raise FileNotFoundError(f"Can't resume: {self.run_dir} has no metadata.json.")
+        elif self.run_dir.exists() and any(
+            p.suffix in (".npz", ".npy") or p.name == "metadata.json" for p in self.run_dir.iterdir()
+        ):
+            raise FileExistsError(
+                f"Run folder {self.run_dir} already contains scan data. Choose a new run name "
+                "(or move the old data) so it isn't overwritten."
+            )
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._sdata: np.ndarray | None = None
+
+    def save_metadata(self, metadata: dict[str, Any]) -> Path | None:
+        if not self.config.save_metadata_json:
+            return None
+        path = self.run_dir / "metadata.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        return path
+
+    def record_resume(self, entry: dict[str, Any]) -> None:
+        """Resumed runs: adds entry to the "resumes" list in metadata.json, keeping everything
+        the run originally saved there."""
+        path = self.run_dir / "metadata.json"
+        with open(path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        metadata.setdefault("resumes", []).append(entry)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        os.replace(tmp, path)
+
+    def save_point(
+        self,
+        point: ScanPoint,
+        voltages_v: np.ndarray,
+        voltage_index: int,
+        sdata: np.ndarray,
+        frequencies_hz: np.ndarray,
+        physical_xy: tuple[float, float],
+        extra: dict | None = None,
+    ) -> Path | None:
+        """Fills slot voltage_index of this coordinate's file and rewrites the file."""
+        if not self.config.save_individual_npz:
+            return None
+        path = self.run_dir / point_filename(point)
+        arrays = self._load_or_create(path, point, voltages_v, frequencies_hz, physical_xy)
+        for key, value in (extra or {}).items():
+            arrays.setdefault(key, value)
+
+        arrays["e"][voltage_index] = voltages_v[voltage_index]
+        arrays["sdata"][voltage_index] = sdata
+        arrays["measured"][voltage_index] = True
+        arrays["measured_time"][voltage_index] = time.time()
+        arrays["iteration"] = np.int64(voltage_index)
+
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as f:  # a file object, so numpy doesn't append ".npz" to the name
+            np.savez(f, **arrays)
+        os.replace(tmp, path)  # atomic: the old file stays intact until the new one is complete
+        return path
+
+    def save_transient(self, point: ScanPoint, arrays: dict, physical_xy: tuple[float, float]) -> Path:
+        """Writes one transient capture (see the module docstring) as this element's file."""
+        path = self.run_dir / point_filename(point)
+        out = {
+            **arrays,
+            "measured": np.ones(1, dtype=bool),
+            "measured_time": np.array([time.time()]),
+            "iteration": np.int64(0),
+            "frequencies_hz": np.array([float(arrays["freq_hz"])]),
+            "density": np.str_(point.density),
+            "logical_row": np.int64(point.logical_row),
+            "logical_col": np.int64(point.logical_col),
+            "y_loop": np.int64(point.y_loop),
+            "x_loop": np.int64(point.x_loop),
+            "stage_x_mm": np.float64(point.stage_x_mm),
+            "stage_y_mm": np.float64(point.stage_y_mm),
+            "physical_x_mm": np.float64(physical_xy[0]),
+            "physical_y_mm": np.float64(physical_xy[1]),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as f:
+            np.savez(f, **out)
+        os.replace(tmp, path)
+        return path
+
+    @staticmethod
+    def _load_or_create(path: Path, point: ScanPoint, voltages_v: np.ndarray,
+                        frequencies_hz: np.ndarray, physical_xy: tuple[float, float]) -> dict:
+        if path.exists():
+            with np.load(path) as existing:
+                return {k: existing[k].copy() for k in existing.files}
+        v, n = len(voltages_v), len(frequencies_hz)
+        return {
+            # data slots, all "empty" until measured
+            "e": np.full(v, np.nan),
+            "sdata": np.full((v, n), np.nan + 1j * np.nan, dtype=np.complex128),
+            "measured": np.zeros(v, dtype=bool),
+            "measured_time": np.full(v, np.nan),
+            "iteration": np.int64(-1),
+            # fixed for the whole run
+            "voltages_v": np.asarray(voltages_v, dtype=float),
+            "frequencies_hz": np.asarray(frequencies_hz, dtype=float),
+            "density": np.str_(point.density),
+            "logical_row": np.int64(point.logical_row),
+            "logical_col": np.int64(point.logical_col),
+            "y_loop": np.int64(point.y_loop),
+            "x_loop": np.int64(point.x_loop),
+            "stage_x_mm": np.float64(point.stage_x_mm),
+            "stage_y_mm": np.float64(point.stage_y_mm),
+            "physical_x_mm": np.float64(physical_xy[0]),
+            "physical_y_mm": np.float64(physical_xy[1]),
+        }
+
+    # ------------------------------------------------ optional whole-run summary ----
+
+    def open_summary_arrays(self, point_count: int, voltage_count: int, vna_points: int,
+                            points: list[ScanPoint] | None = None) -> np.ndarray | None:
+        """
+        Optional (save_summary_npz, off by default): one disk-backed array of every trace,
+        shape (point_count, voltage_count, vna_points), in active-point order. It duplicates
+        the per-coordinate files, so it doubles disk use; turn it on only if an analysis
+        wants everything in one array.
+        """
+        if not self.config.save_summary_npz:
+            return None
+        self._sdata = np.lib.format.open_memmap(
+            self.run_dir / "summary_sdata.npy", mode="w+", dtype=np.complex128,
+            shape=(point_count, voltage_count, vna_points),
+        )
+        if self.resume and points is not None:
+            # Rebuilt from the per-coordinate files, which are the record of what was measured.
+            for p_idx, point in enumerate(points):
+                path = self.run_dir / point_filename(point)
+                if path.exists():
+                    with np.load(path) as f:
+                        measured, sdata = f["measured"], f["sdata"]
+                        self._sdata[p_idx, measured] = sdata[measured]
+        return self._sdata
+
+    def finalize_summary(self, voltages_v: np.ndarray, active_points: np.ndarray,
+                         frequencies_hz: np.ndarray) -> Path | None:
+        if not self.config.save_summary_npz:
+            return None
+        self._sdata.flush()
+        path = self.run_dir / "summary_index.npz"
+        np.savez(path, voltages_v=voltages_v, active_points=active_points, frequencies_hz=frequencies_hz)
+        return path

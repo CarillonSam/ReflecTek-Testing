@@ -1,8 +1,8 @@
 # Array Scan Project
 
-**Version 1.19.0.** The Analysis tab shows **Transient** runs: a heatmap of each element's rise or
+**Version 1.18.1.** The Analysis tab shows **Transient** runs: a heatmap of each element's rise or
 fall time for any change in the profile, and each element's phase and magnitude against time. 1.18.0
-added the Transient scan type: at every point, one continuous CW capture of S11 against time while the
+added the Transient scan type (1.18.1 also fixes its VNA arming and trigger order): at every point, one continuous CW capture of S11 against time while the
 board steps through a voltage profile such as 0, 10, 0. 1.17.0 added
 **Resume Scan...** for scans that stopped before finishing; 1.16.0 made the Scan tab pause and ask
 what to do when the stage doesn't reach a point; 1.15.0 added "Raw phase at voltage" to the Analysis tab's heatmap; 1.14.0 added a nudge pad, an
@@ -466,6 +466,23 @@ Tested against a simulated VNA whose samples follow the board voltage: the edges
 trace matched the recorded step times to within one sample, plus the constant trigger delay, with
 the VNA both slower and faster than the estimate, with both trigger types, and across a resume.
 
+**Arming and triggering (fixed in V1.18.1).** Each element's capture follows the order of the proven
+SpecVision range script. USB trigger: `:TRIG:SOUR EXT` first, then `:SENS1:HOLD:FUNC SING`, then a
+wait of `ARM_SETTLE_S` (5 s, in vna.py) before the pulse. When the capture has had time to finish,
+`:SENS1:HOLD:FUNC HOLD`, a 0.1 s pause, and then the buffer is read. 1.18.0 had two faults here.
+It set single-sweep hold before switching the trigger source to external, so the sweep started at
+the arm under the internal trigger, not at the pulse. It also fired immediately after arming,
+while the MS46322B is still busy (about 3 s), so the pulse was dropped and the read returned the
+previous capture, which was then saved as this element's data. Software trigger now holds the
+channel and sends `:TRIG:SING`, the same trigger the frequency-sweep scans use. The byte order is
+set explicitly (`:FORM:BORD SWAP`, little-endian, matching the read). A capture identical to the
+previous one is refused, not saved: real captures never repeat bit for bit, so it means the trigger
+was missed (raise `ARM_SETTLE_S` if that happens). This can't catch a miss on the first element
+after setup. **`ARM_SETTLE_S` adds 5 s to every element** (about 2.8 h over 2048 elements), so it is
+worth measuring this VNA's real arming time and shortening it. Checked against a simulated
+MS46322B with those behaviours: 1.18.0 saved one real sweep for three elements (the other two were
+copies), and 1.18.1 gets one triggered sweep per element. Not yet tested on the instrument.
+
 **The VNA afterwards.** CW capture changes the VNA's mode, IF bandwidth, trigger source and hold
 function. These are read before the scan and put back when it ends, error or not, so the next
 frequency-sweep scan isn't left in CW mode waiting for an external trigger.
@@ -478,7 +495,7 @@ has `scan_mode: "transient"` and the capture's points and sample interval. **Res
 works as for the other scan types, taking the trigger port from the current settings with the
 other connection settings.
 
-### Transient runs in the Analysis tab (V1.19.0)
+### Transient runs in the Analysis tab (V1.18.1)
 
 Load a transient run folder as usual. The heatmap-options row is replaced by a **Transition** row:
 **Rise** / **Fall**, then a dropdown of that direction's changes in the profile, each labelled with

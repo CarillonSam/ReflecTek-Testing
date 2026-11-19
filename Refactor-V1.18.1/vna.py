@@ -9,6 +9,15 @@ time divided by the number of points. A capture that comes back with a different
 points than was set up is refused, since cw_dt_s would then be wrong for it. setup_cw reads
 the settings CW capture changes (CW mode, IF bandwidth, trigger source, hold function) and
 close() puts them back, so the next frequency sweep isn't left waiting for an external trigger.
+
+The arm / trigger / read order follows the proven SpecVision range script (VnaInstance):
+  arm:  :TRIG:SOUR EXT first, THEN :SENS1:HOLD:FUNC SING. Setting single-sweep hold while the
+        source is still internal starts a sweep straight away, before the trigger, so the
+        capture wouldn't line up with the profile and the external pulse would be ignored.
+  wait: ARM_SETTLE_S after arming. The MS46322B is busy for about 3 s after the arm and drops a
+        trigger edge that arrives in that window: no sweep runs, and the read returns whatever
+        the previous capture left in the buffer. *OPC? does not wait for this.
+  read: :SENS1:HOLD:FUNC HOLD, a short pause, THEN read the buffer.
 """
 
 from __future__ import annotations
@@ -24,6 +33,13 @@ import numpy as np
 import pyvisa
 
 from config import TransientConfig, VNAConfig
+
+ARM_SETTLE_S = 5.0
+"""Seconds to wait after arming a USB-triggered CW capture before firing the trigger. The MS46322B
+was measured busy for about 3 s after the arm (a trigger in that window is dropped); 5 is that plus
+margin, the value from the proven reference script. Worth shortening once measured on this VNA:
+it is added to every element's capture."""
+READ_SETTLE_S = 0.1   # after :SENS1:HOLD:FUNC HOLD, before reading the buffer (as in the reference)
 
 # Settings CW capture changes, put back by close() (query = command + "?").
 CW_RESTORED_SETTINGS = (":SENS1:SWE:CW", ":SENS1:BAND", ":TRIG:SOUR", ":SENS1:HOLD:FUNC")
@@ -86,6 +102,7 @@ class VNAController(VNAInstrument):
         self.cw_sweep_time_s = 0.0
         self.cw_dt_s = 0.0
         self.cw_dt_source = ""
+        self._last_cw: Optional[np.ndarray] = None   # previous capture, to catch a stale buffer
 
     def _ensure_open(self) -> None:
         if self.instr is None:
@@ -205,6 +222,7 @@ class VNAController(VNAInstrument):
             self._write_checked(f":SENS1:BAND {t.ifbw_hz}")
             self._write_checked(f":SENS1:SWE:CW:POIN {points}")
             self._write_checked(":FORM:DATA REAL")                 # 64-bit binary
+            self._write_checked(":FORM:BORD SWAP")                 # little-endian, to match read_cw's is_big_endian=False
             self._write_checked(":CALC1:PAR1:DEF S11")
             self._write_checked(":CALC1:PAR1:SEL")
             self.instr.query("*OPC?")
@@ -220,16 +238,28 @@ class VNAController(VNAInstrument):
             points = math.ceil(points * duration / sweep_time) + 1
         else:
             raise RuntimeError(f"Couldn't set up a CW capture covering {duration:g} s (last: {sweep_time:g} s).")
+        self._last_cw = None
         self.cw_points, self.cw_sweep_time_s = points, sweep_time
         self.cw_dt_s, self.cw_dt_source = sweep_time / points, source
         logging.info("CW capture: %.4f GHz, IFBW %g Hz, %d points, one every %.4f ms, %.3f s (%s)",
                      t.freq_hz / 1e9, t.ifbw_hz, points, self.cw_dt_s * 1e3, sweep_time, source)
 
     def arm_cw(self) -> None:
-        """Single-sweep hold, waiting for the trigger."""
-        self.instr.write(":SENS1:HOLD:FUNC SING")
-        self.instr.write(f":TRIG:SOUR {'EXT' if self._cw.trigger == 'usb' else 'INT'}")
-        self.instr.query("*OPC?")
+        """Gets ready for one capture; called before every element (the single-sweep hold fires
+        once and then holds, so it has to be re-armed each time).
+
+        USB trigger: trigger source external FIRST, then single-sweep hold, then wait
+        ARM_SETTLE_S so the VNA has finished arming before the pulse (see the module notes).
+        Software trigger: the channel is simply held, and fire_cw sends :TRIG:SING, the same
+        trigger the frequency-sweep scans use."""
+        if self._cw.trigger == "usb":
+            self.instr.write(":TRIG:SOUR EXT")
+            self.instr.write(":SENS1:HOLD:FUNC SING")
+            self.instr.query("*OPC?")
+            time.sleep(ARM_SETTLE_S)
+        else:
+            self.instr.write(":SENS1:HOLD:FUNC HOLD")
+            self.instr.query("*OPC?")
 
     def fire_cw(self) -> float:
         """Starts the capture. Returns time.perf_counter() taken immediately before the trigger
@@ -242,15 +272,24 @@ class VNAController(VNAInstrument):
         return t0
 
     def read_cw(self) -> np.ndarray:
+        """Called once the capture has had time to finish. Holds the channel first, then reads,
+        the order the reference script uses."""
+        self.instr.write(":SENS1:HOLD:FUNC HOLD")
+        time.sleep(READ_SETTLE_S)
         raw = self.instr.query_binary_values(":CALC1:DATA:SDATA?", datatype="d", is_big_endian=False,
                                              container=np.array)
         if raw.size % 2:
             raise RuntimeError(f"The VNA returned an odd number of values ({raw.size}) for complex S11.")
         s11 = raw[0::2] + 1j * raw[1::2]
-        self.instr.write(":SENS1:HOLD:FUNC HOLD")   # keep the trace frozen after reading
         if s11.size != self.cw_points:
             raise RuntimeError(f"The VNA returned {s11.size} points instead of {self.cw_points}, so the time axis "
                                "would be wrong for this capture; not saved.")
+        if self._last_cw is not None and np.array_equal(s11, self._last_cw):
+            # A dropped trigger leaves the previous capture in the buffer. Real captures never
+            # repeat bit for bit (noise alone sees to that), so this is the VNA not having swept.
+            raise RuntimeError("The VNA returned exactly the previous capture: the trigger was missed and no "
+                               "sweep ran. Not saved. If this keeps happening, raise ARM_SETTLE_S in vna.py.")
+        self._last_cw = s11.copy()
         return s11
 
     def _restore_after_cw(self) -> None:

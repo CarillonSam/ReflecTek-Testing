@@ -193,8 +193,24 @@ class PiBoardController(BoardController):
 
         self.pi.update_dacs()
 
+    def set_uniform_voltage(self, voltage_v: float) -> None:
+        """Whole board at one voltage (uniform sweeps and uniform transient scans): BOTH files
+        are filled with it, each at its band's full configured size, DataHB at hb_shape and
+        DataLB at lb_shape (rows, cols), independent of the grid being scanned. The voltage
+        is clipped to the configured range, like set_voltage_grid."""
+        v = float(np.clip(voltage_v, self.config.min_voltage_v, self.config.max_voltage_v))
+        shapes = {"hb_shape": tuple(self.config.hb_shape), "lb_shape": tuple(self.config.lb_shape)}
+        for name, shape in shapes.items():
+            if len(shape) != 2 or min(shape) < 1:
+                raise ValueError(f"PiControllerConfig.{name} must be (rows, cols) with both above 0, not {shape}.")
+        self._write_csv_2d(self.config.local_file_hb, np.full(shapes["hb_shape"], v))
+        self._write_csv_2d(self.config.local_file_lb, np.full(shapes["lb_shape"], v))
+        active = shapes["hb_shape"] if self.config.active_band == "hb" else shapes["lb_shape"]
+        self._written_grid = np.full(active, round(v, 4))
+        self.pi.update_dacs()
+
     def element_voltage(self, density: str, row: int, col: int) -> float:
-        """The value last written to the Pi's grid file for this element (the scanned density's
+        """The value last written to the Pi's grid file for this element (the active band's
         grid, 4 decimals); NaN if nothing has been written or it's outside that grid."""
         grid = getattr(self, "_written_grid", None)
         if grid is None or not (0 <= row < grid.shape[0] and 0 <= col < grid.shape[1]):

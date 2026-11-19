@@ -171,6 +171,14 @@ class AutomatedArrayScanner:
     def _uniform_grid(self, voltage_v: float) -> np.ndarray:
         return np.full(self.grid_shape, voltage_v, dtype=float)
 
+    def _set_uniform(self, voltage_v: float) -> None:
+        """Whole board at one voltage. The Pi controller writes its full-size band files
+        (hb_shape / lb_shape) for this; other controllers take the scanned grid."""
+        if hasattr(self.array, "set_uniform_voltage"):
+            self.array.set_uniform_voltage(voltage_v)
+        else:
+            self.array.set_voltage_grid(self._uniform_grid(voltage_v))
+
     def _single_point_grid(self, point: ScanPoint, voltage_v: float) -> np.ndarray:
         """Every element at 0 V except this point's. The controller addresses that element
         by its index in the pinout (pinout.py)."""
@@ -184,7 +192,7 @@ class AutomatedArrayScanner:
             return
 
         assert self.array is not None
-        self.array.set_voltage_grid(self._uniform_grid(voltage_v))
+        self._set_uniform(voltage_v)
         time.sleep(self.config.uniform_board_settle_s)
 
     def program_voltage_for_point(self, point: ScanPoint, voltage_v: float) -> None:
@@ -525,9 +533,10 @@ class AutomatedArrayScanner:
         return {"points": points, "dt_s": dt, "sweep_time_s": points * dt, "dt_source": "estimate (dry run)"}
 
     def _set_board(self, point: ScanPoint, voltage_v: float) -> None:
-        grid = (self._uniform_grid(voltage_v) if self.config.uniform_board_mode
-                else self._single_point_grid(point, voltage_v))
-        self.array.set_voltage_grid(grid)
+        if self.config.uniform_board_mode:
+            self._set_uniform(voltage_v)
+        else:
+            self.array.set_voltage_grid(self._single_point_grid(point, voltage_v))
 
     def _capture_transient(self, point: ScanPoint, capture: dict) -> dict:
         """One continuous capture at this point while the board steps through the profile.

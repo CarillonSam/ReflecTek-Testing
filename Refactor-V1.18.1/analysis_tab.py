@@ -662,13 +662,17 @@ class AnalysisTab(ttk.Frame):
         if transient:
             metric, freq = "transition_time", float("nan")
             trans, results = self._transition_results()
-            values = np.array([results[k].time_s * 1e3 if results else np.nan for k in keys])
+            values = np.array([results[k].time_s if results else np.nan for k in keys])
+            # Seconds once the typical time reaches 1 s (Pi falls take tens of seconds), else ms.
+            trans_unit = "s" if np.isfinite(values).any() and np.nanmedian(values) >= 1 else "ms"
+            if trans_unit == "ms":
+                values = values * 1e3
             if trans is None:
                 title = f"This profile has no {self.trans_dir_var.get().lower()}s"
             else:
                 el = next(iter(self.dataset.elements.values()))
                 ts = self.trans_settings
-                title = (f"Transition time (ms), {trans.label}\n\u00b1{ts.tolerance_pct:g}% of each element's "
+                title = (f"Transition time ({trans_unit}), {trans.label}\n\u00b1{ts.tolerance_pct:g}% of each element's "
                          f"phase change, CW {el.freq_hz / 1e9:g} GHz")
                 bad = int(np.isnan(values).sum())
                 if bad:
@@ -722,7 +726,7 @@ class AnalysisTab(ttk.Frame):
             elif scale_note:
                 self._colorbar.set_ticks(_volt_ticks(vmin, vmax, norm))  # labelled in volts, spaced by the logistic scale
             elif metric == "transition_time":
-                self._colorbar.set_label("ms", fontsize=8)
+                self._colorbar.set_label(trans_unit, fontsize=8)
         if transient:
             ax.set_title(title, fontsize=9)
         else:
@@ -1043,18 +1047,25 @@ def _draw_vs_frequency(ax, p, data, ylabel: str, title: str) -> None:
     _style(ax)
 
 
+def _fmt_duration(t_s: float) -> str:
+    return f"{t_s * 1e3:.3g} ms" if t_s < 1 else f"{t_s:.3g} s"
+
+
 def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
     """Transient runs: the element's whole capture, raw phase (unwrapped in time) and magnitude
-    vs time. Dotted lines mark when each voltage change was sent; for the chosen transition,
+    vs time. Dotted lines mark where each voltage change starts in the trace; for the chosen transition,
     the start and end tolerance bands, the settled windows they came from, and the measured
     transition (departure to arrival) are drawn."""
     ax_p, ax_m = fig.subplots(2, 1, sharex=True)
     t = el.time_s
     ax_p.plot(t, el.phase_deg, lw=0.8, color=TRACE_COLOR)
     ax_m.plot(t, el.mag_db, lw=0.8, color=TRACE_COLOR)
-    for sent in el.step_sent_s:
-        for ax in (ax_p, ax_m):
-            ax.axvline(sent, color="gray", ls=":", lw=0.9)
+    # Where each step starts: the capture start, then each detected change (NaN = not found).
+    step_starts = np.concatenate([[0.0], el.change_s])
+    for start in step_starts[1:]:
+        if np.isfinite(start):
+            for ax in (ax_p, ax_m):
+                ax.axvline(start, color="gray", ls=":", lw=0.9)
 
     ok = result is not None and result.status == "ok"
     if result is not None and result.window_from is not None:
@@ -1062,15 +1073,16 @@ def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
         b0, b1 = result.window_to
         for (w0, w1) in (result.window_from, result.window_to):
             ax_p.axvspan(w0, w1, color="gray", alpha=0.12, lw=0)
-        for x0, x1, centre, color, name in ((a0, result.command_s, result.phase_from, START_BAND_COLOR, "Start band"),
-                                           (result.command_s, b1, result.phase_to, END_BAND_COLOR, "End band")):
+        mid = result.change_s if np.isfinite(result.change_s) else a1
+        for x0, x1, centre, color, name in ((a0, mid, result.phase_from, START_BAND_COLOR, "Start band"),
+                                           (mid, b1, result.phase_to, END_BAND_COLOR, "End band")):
             ax_p.fill_between([x0, x1], centre - result.tol_deg, centre + result.tol_deg, color=color, alpha=0.22,
                               lw=0, label=f"{name} ({centre:.1f} \u00b1 {result.tol_deg:.1f}\u00b0)")
             ax_p.hlines(centre, x0, x1, color=color, lw=1.0, ls="--")
     if ok:
         for ax in (ax_p, ax_m):
             ax.axvspan(result.depart_s, result.arrive_s, color=SELECT_COLOR, alpha=0.18, lw=0,
-                       label=f"Transition ({result.time_s * 1e3:.3g} ms)" if ax is ax_p else None)
+                       label=f"Transition ({_fmt_duration(result.time_s)})" if ax is ax_p else None)
         for when in (result.depart_s, result.arrive_s):
             ax_p.plot([when], [np.interp(when, t, el.phase_deg)], "o", ms=4, color=SELECT_COLOR)
     if result is not None and result.window_from is not None:
@@ -1081,7 +1093,8 @@ def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
             pad = max(2 * (result.arrive_s - result.depart_s), 20 * el.dt_s)
             x0, x1 = result.depart_s - pad, result.arrive_s + pad
         else:   # nothing measured: show the change itself and what follows it
-            x0, x1 = result.command_s - 0.1 * el.hold_s, result.command_s + 0.5 * el.hold_s
+            mid = result.change_s if np.isfinite(result.change_s) else result.window_from[1]
+            x0, x1 = mid - 0.1 * el.hold_s, mid + 0.5 * el.hold_s
         ax_p.set_xlim(x0, x1)
         visible = (t >= x0) & (t <= x1)
         for ax, y in ((ax_p, el.phase_deg), (ax_m, el.mag_db)):
@@ -1099,14 +1112,15 @@ def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
     # Voltage of each step, above its line (only the lines in view, so zooming doesn't spill them)
     label_tf = matplotlib.transforms.blended_transform_factory(ax_p.transData, ax_p.transAxes)
     x0, x1 = ax_p.get_xlim()
-    for sent, v in zip(el.step_sent_s, el.voltages_v):
-        if x0 <= sent <= x1:
-            ax_p.text(sent, 1.01, f"{v:g} V", transform=label_tf, fontsize=7, color="gray", va="bottom", ha="center")
+    for start, v in zip(step_starts, el.voltages_v):
+        if np.isfinite(start) and x0 <= start <= x1:
+            ax_p.text(start, 1.01, f"{v:g} V", transform=label_tf, fontsize=7, color="gray", va="bottom",
+                      ha="left" if start == 0 else "center")
     ax_p.set_ylabel("Phase, unwrapped (deg)", fontsize=8)
     ax_p.set_title(f"Raw S11 phase vs. time at {el.freq_hz / 1e9:g} GHz", fontsize=9, pad=12)
     ax_m.set_ylabel("|S11| (dB)", fontsize=8)
     ax_m.set_title("Raw S11 magnitude vs. time", fontsize=9)
-    ax_m.set_xlabel("Time from trigger (s)", fontsize=8)
+    ax_m.set_xlabel("Time from capture start (s)", fontsize=8)
     for ax in (ax_p, ax_m):
         _style(ax)
 
@@ -1114,7 +1128,10 @@ def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
     if trans is None:
         line = "no transition of this kind in the profile"
     elif ok:
-        line = f"{trans.label}: {result.time_s * 1e3:.3g} ms"
+        line = f"{trans.label}: {_fmt_duration(result.time_s)}"
+        if np.isfinite(result.offset_at_change_deg):
+            line += (f"  (already {result.offset_at_change_deg:+.2f}\u00b0 off its start phase when the voltage "
+                     "changed: timed from the change)")
     else:
         line = f"{trans.label}: no time, {result.reason if result is not None else 'not computed'}"
     fig.suptitle(f"{head}\n{line}", fontsize=10)

@@ -617,11 +617,29 @@ def process_dataset(ds: Dataset, settings: AnalysisSettings, progress=None) -> d
 # board steps through a voltage profile (see data.py). There is one frequency, so nothing is
 # time-gated or calibrated: this is the raw S11 phase and magnitude at the CW frequency.
 #
+# Loading cleans up two things the capture can't be trusted on:
+#   * Unmeasured tail. If the buffer is read before the sweep has finished, the points not yet
+#     measured come back as exactly 1+0j (or 0). That run of filler at the end is dropped.
+#   * The time axis. Each change of voltage is found in the trace itself (the board changing is
+#     an abrupt step in S11). When the file's sample interval is only an estimate (dt_source not
+#     "instrument"), the real interval is recovered from the detected changes: they are known to
+#     be (step_done_s[i+1] - step_done_s[i]) apart on the PC clock, so samples between them /
+#     seconds between them gives dt. One interval is used for the whole run (it's a property of
+#     the VNA settings), the median over its elements. The PC-clock times themselves are not
+#     used to place anything: the Pi applies a change about a second after it was sent, and
+#     that lag varies.
+#
+# Holds run from one detected change to the next (the first from the start of the capture, the
+# last to the end of the measured data). The board can already move before a change appears:
+# the Pi stops its DAC program about a second before the new voltage takes effect (on the sample
+# run, the 10 V hold drops about 1 deg 1.5-1.75 s before the 10 -> 0 V change). So each hold's
+# quiet part ends at its "update start": before the next change by the controller's update time
+# (step_done_s - step_sent_s) plus UPDATE_MARGIN_S for the VNA's trigger latency (at most half
+# the hold), or by guard_pct of the hold, whichever is longer.
+#
 # Transition time, for the change from step i to step i + 1 of the profile:
 #   1. Settled phase of each step: the mean phase over the last `settle_pct` of that step's
-#      hold, ending `guard_pct` of the hold before the next change was sent. The guard keeps
-#      the start of the next change out of the average even if the VNA's trigger delay puts
-#      it a little early in the trace.
+#      hold, ending at its update start (above).
 #   2. Tolerance: `tolerance_pct` of this transition's own phase change, the difference
 #      between the two settled phases (e.g. 20 -> 200 deg: 10% of 180 = +-18 deg; 2 -> 20 deg:
 #      +-1.8 deg). The same tolerance is used for both bands.
@@ -629,22 +647,33 @@ def process_dataset(ds: Dataset, settings: AnalysisSettings, progress=None) -> d
 #   4. Arrival: the moment the phase enters the end band for the last time, so it stays in the
 #      band until the end of step i + 1's settled window (overshoot or ringing that leaves the
 #      band again restarts the clock).
-#   5. Departure: the last moment before arrival that the phase leaves the start band, through
-#      either edge (wrapping is handled by unwrapping the phase in time first).
+#   5. Departure: the first moment, from the detected change on, that the phase leaves the start
+#      band, through either edge (wrapping is handled by unwrapping the phase in time first).
+#      Counting from the change means earlier noise can't start the clock, and a response that
+#      swings away and later passes back through the start band (as 10 -> 0 V falls do) is
+#      timed from when it first moved, not from the later pass. If the controller's update has
+#      already pushed the phase out of the start band by the time the change arrives (the Pi's
+#      dip, above), the clock starts at the change itself: it times the element's response to
+#      the new voltage, not the controller's update. How far off it already was is recorded
+#      (offset_at_change_deg) and shown in the element view.
 #   6. Transition time = arrival - departure. Both crossings are interpolated between samples.
-# Both moments come from the same trace, so the VNA's trigger delay doesn't enter the result.
-# The recorded step times are only used to find each hold (and are drawn on the plots).
 
 TRANSIENT_HEATMAP_METRICS = {"Transition time (ms)": "transition_time"}
 TRANSIENT_DIRECTIONS = ("Rise", "Fall")
 MIN_SETTLE_SAMPLES = 3
+CHANGE_LAG_S = 0.05        # change detection compares samples this far apart (at least 1 sample)
+CHANGE_THRESHOLD = 10.0    # ...and calls it a change above median + this many robust sigmas
+CHANGE_FLOOR = 0.001       # ...or above this fraction of the change's own jump (matters only on noise-free data)
+CHANGE_SEARCH = 0.25       # search +- this fraction of a hold around where the change is expected
+DT_MISMATCH_NOTE = 0.01    # an instrument-reported interval this far off the changes gets a note
+UPDATE_MARGIN_S = 1.0      # added to the controller's update time when ending a hold's quiet part
 
 
 @dataclass
 class TransientSettings:
     tolerance_pct: float = 10.0   # band half-width, % of this transition's phase change (< 50, so bands never overlap)
     settle_pct: float = 10.0      # settled phase = mean over the last this-% of each hold...
-    guard_pct: float = 2.0        # ...ending this % of the hold before the next change was sent
+    guard_pct: float = 2.0        # ...ending at least this % of the hold before the next change (see update start)
 
 
 @dataclass
@@ -654,17 +683,20 @@ class TransientElement:
     col: int
     file_name: str
     position_mm: tuple[float, float] | None
-    dt_s: float
-    phase_deg: np.ndarray       # (n,) raw S11 phase, unwrapped in time
+    dt_s: float                 # sample interval used (recovered from the changes when the file's was estimated)
+    phase_deg: np.ndarray       # (n,) raw S11 phase, unwrapped in time (measured samples only)
     mag_db: np.ndarray          # (n,) raw |S11| in dB
     voltages_v: np.ndarray      # (S,) the profile
     hold_s: float
-    step_sent_s: np.ndarray     # (S,) when each change was sent, from the trigger
+    step_sent_s: np.ndarray     # (S,) when each change was sent, from the trigger (PC clock)
     step_done_s: np.ndarray     # (S,) when the controller returned
     applied_v: np.ndarray | None
     freq_hz: float
     ifbw_hz: float | None = None
     dt_source: str = ""
+    dt_file_s: float = float("nan")   # the interval the file was saved with
+    n_file: int = 0                   # points in the file, including any unmeasured tail
+    changes: np.ndarray | None = None  # (S - 1,) sample index where each change starts; -1 = not found
     scan_type: str = "transient"
 
     @property
@@ -677,7 +709,13 @@ class TransientElement:
 
     @property
     def time_s(self) -> np.ndarray:
-        return np.arange(self.n) * self.dt_s   # exactly as saved: nothing resampled
+        return np.arange(self.n) * self.dt_s   # nothing resampled: sample k is at k * dt
+
+    @property
+    def change_s(self) -> np.ndarray:
+        """When each change starts in the trace (s), NaN where it wasn't found."""
+        c = np.asarray(self.changes if self.changes is not None else [], dtype=float)
+        return np.where(c >= 0, c * self.dt_s, np.nan)
 
 
 @dataclass
@@ -703,7 +741,8 @@ class TransitionResult:
     tol_deg: float = float("nan")
     window_from: tuple[float, float] | None = None   # the settled windows used (s)
     window_to: tuple[float, float] | None = None
-    command_s: float = float("nan")   # when the change was sent (PC clock, from the trigger)
+    change_s: float = float("nan")    # when the change starts in the trace
+    offset_at_change_deg: float = float("nan")   # phase - start phase at the change, if already outside the start band
 
     @property
     def reason(self) -> str:
@@ -714,7 +753,7 @@ TRANSITION_REASONS = {
     "ok": "",
     "small_step": "no phase change between the two settled phases",
     "not_settled": "never stays inside the end band",
-    "no_start": "never inside the start band before arriving",
+    "no_start": "the change wasn't found in the trace",
     "short_hold": "hold too short to find a settled phase",
     "no_step": "this element's capture doesn't include this step",
 }
@@ -748,6 +787,73 @@ def _is_transient_folder(folder: str) -> bool:
     return False
 
 
+def _measured_length(s11: np.ndarray) -> int:
+    """Samples before the unmeasured tail: a buffer read before the sweep finished returns the
+    points not yet measured as exactly 1+0j (or 0)."""
+    filler = (s11 == 1) | (s11 == 0) | ~np.isfinite(s11)
+    real = np.flatnonzero(~filler)
+    return int(real[-1]) + 1 if real.size else 0
+
+
+def _step_times(sent: np.ndarray, done: np.ndarray) -> np.ndarray:
+    """PC-clock time of each change, for spacing only: when the controller returned, which on
+    the six-element sample run tracks the change seen in the trace more closely than when it
+    was sent."""
+    return done if done.shape == sent.shape and np.isfinite(done).all() else sent
+
+
+def _find_changes(s11: np.ndarray, dt: float, hold_s: float, times: np.ndarray) -> np.ndarray:
+    """Sample index where each change (step 1 onwards) starts, -1 if not found. Each is looked
+    for within CHANGE_SEARCH of a hold around where it's expected, from the previous change and
+    the PC-clock spacing, using the interval measured so far once two have been found. The
+    change is the biggest jump |s11[k] - s11[k - lag]| there, walked back to where that jump
+    first rose above the noise before it (a backward difference, so it rises at the change
+    itself)."""
+    n = s11.size
+    lag = max(1, int(round(CHANGE_LAG_S / dt)))
+    jump = np.zeros(n)
+    if n > lag:
+        jump[lag:] = np.abs(s11[lag:] - s11[:-lag])
+    out = np.full(len(times) - 1, -1, dtype=np.int64)
+    found_k, found_t = [], []
+    prev_k, prev_t, dt_cur = 0.0, 0.0, dt
+    for i in range(1, len(times)):
+        hold_n = max(hold_s, times[i] - times[i - 1]) / dt_cur
+        expected = prev_k + (times[i] - prev_t) / dt_cur
+        lo = int(max(prev_k + CHANGE_SEARCH * hold_n if found_k else lag, expected - CHANGE_SEARCH * hold_n))
+        hi = int(min(n, expected + CHANGE_SEARCH * hold_n))
+        if hi - lo < 10:
+            continue
+        w = jump[lo:hi]
+        peak = int(np.argmax(w))
+        quiet = w[:peak - 2 * lag] if peak - 2 * lag >= 20 else w   # noise from before the change
+        med = float(np.median(quiet))
+        sigma = 1.4826 * float(np.median(np.abs(quiet - med)))
+        if w[peak] <= med + CHANGE_THRESHOLD * sigma:
+            continue
+        thr = med + max(CHANGE_THRESHOLD * sigma, CHANGE_FLOOR * (w[peak] - med))
+        below = np.flatnonzero(w[:peak] < thr)
+        k = lo + (int(below[-1]) + 1 if below.size else 0)
+        out[i - 1] = k
+        found_k.append(k)
+        found_t.append(times[i])
+        prev_k, prev_t = float(k), float(times[i])
+        if len(found_k) >= 2:
+            dt_cur = float(np.polyfit(found_k, found_t, 1)[0])
+    return out
+
+
+def _interval_from_changes(el: TransientElement) -> float:
+    """This element's sample interval from its detected changes and their PC-clock spacing
+    (NaN with fewer than two)."""
+    times = _step_times(el.step_sent_s, el.step_done_s)[1:]
+    ok = el.changes >= 0
+    if ok.sum() < 2:
+        return float("nan")
+    slope = float(np.polyfit(el.changes[ok].astype(float), times[ok], 1)[0])
+    return slope if slope > 0 else float("nan")
+
+
 def load_transient_element(path: str) -> TransientElement:
     name = os.path.basename(path)
     with np.load(path) as z:
@@ -755,9 +861,13 @@ def load_transient_element(path: str) -> TransientElement:
         missing = [k for k in ("s11", "dt_s", "voltages_v", "step_sent_s") if k not in keys]
         if missing:
             raise ValueError(f"not a transient capture (no {', '.join(missing)})")
-        s11 = np.asarray(z["s11"]).ravel()
-        if s11.size < 2 or not np.isfinite(s11).all():
-            raise ValueError("capture is empty or has non-finite samples")
+        raw = np.asarray(z["s11"]).ravel()
+        n = _measured_length(raw)
+        if n < 10:
+            raise ValueError("capture has no measured samples")
+        s11 = raw[:n]
+        if not np.isfinite(s11).all():
+            raise ValueError("capture has non-finite samples")
         phase = np.degrees(np.unwrap(np.angle(s11)))
         with np.errstate(divide="ignore"):
             mag = 20 * np.log10(np.abs(s11))
@@ -774,13 +884,16 @@ def load_transient_element(path: str) -> TransientElement:
         sent = np.asarray(z["step_sent_s"], dtype=float).ravel()
         done = np.asarray(z["step_done_s"], dtype=float).ravel() if "step_done_s" in keys else sent.copy()
         hold = float(z["hold_s"]) if "hold_s" in keys else (float(np.median(np.diff(sent))) if sent.size > 1 else 0.0)
+        dt = float(z["dt_s"])
         return TransientElement(
-            density, row, col, name, position, float(z["dt_s"]),
+            density, row, col, name, position, dt,
             phase.astype(np.float32), mag.astype(np.float32), voltages, hold, sent, done,
             np.asarray(z["applied_v"], dtype=float).ravel() if "applied_v" in keys else None,
             float(z["freq_hz"]) if "freq_hz" in keys else float("nan"),
             float(z["ifbw_hz"]) if "ifbw_hz" in keys else None,
             str(z["dt_source"]) if "dt_source" in keys else "",
+            dt_file_s=dt, n_file=int(raw.size),
+            changes=_find_changes(s11, dt, hold, _step_times(sent, done)),
         )
 
 
@@ -801,12 +914,16 @@ def load_transient_dataset(folder: str, progress=None) -> Dataset:
     try:
         with open(os.path.join(folder, "metadata.json"), encoding="utf-8") as f:
             meta = json.load(f)
-        for k in ("voltages", "voltage_profile", "voltages_v"):
-            if isinstance(meta.get(k), list) and meta[k]:
-                profile = np.asarray(meta[k], dtype=float)
+        for source in (meta.get("transient") or {}, meta):
+            for k in ("voltages_v", "voltages", "voltage_profile"):
+                if isinstance(source.get(k), list) and len(source[k]) > 1:
+                    profile = np.asarray(source[k], dtype=float)
+                    break
+            if profile is not None:
                 break
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         pass
+    notes = []
     if elements:
         # The profile the elements themselves record wins (it's what was actually run);
         # metadata is only a fallback. Elements with a different profile are noted.
@@ -814,19 +931,62 @@ def load_transient_dataset(folder: str, progress=None) -> Dataset:
         common = max(set(profiles), key=profiles.count)
         profile = np.asarray(common, dtype=float)
         odd = sum(p != common for p in profiles)
-    else:
-        odd = 0
-    notes = [f"{odd} element(s) recorded a different profile (shown grey)"] if odd else []
+        if odd:
+            notes.append(f"{odd} element(s) recorded a different profile (shown grey)")
+        notes += _fix_time_axis(elements)
     return Dataset(folder, elements, skipped, "transient", notes=notes, profile_v=profile)
+
+
+def _fix_time_axis(elements: dict) -> list[str]:
+    """Sets every element's sample interval (see the notes at the top of this section) and fills
+    in changes that weren't detected. Returns notes for the run description."""
+    els = list(elements.values())
+    notes = []
+    file_dt = float(np.median([el.dt_file_s for el in els]))
+    estimated = any(el.dt_source != "instrument" for el in els)
+    measured = np.array([_interval_from_changes(el) for el in els])
+    measured = measured[np.isfinite(measured)]
+    if measured.size:
+        dt_run = float(np.median(measured))
+        if estimated:
+            for el in els:
+                el.dt_s = dt_run
+            notes.append(f"sample interval {dt_run * 1e3:.4g} ms, recovered from the voltage changes in "
+                         f"{measured.size} element(s) (the file's {file_dt * 1e3:.4g} ms was an estimate)")
+        elif abs(dt_run / file_dt - 1) > DT_MISMATCH_NOTE:
+            notes.append(f"the VNA's sample interval ({file_dt * 1e3:.4g} ms) disagrees with the voltage changes "
+                         f"({dt_run * 1e3:.4g} ms); the VNA's is used")
+    elif estimated:
+        notes.append(f"sample interval {file_dt * 1e3:.4g} ms is the file's estimate; it couldn't be checked "
+                     "(needs two or more detected voltage changes), so times may be scaled wrong")
+    # Changes not found in an element: placed by the run's usual lag after the PC-clock time.
+    lags = [c * el.dt_s - t for el in els
+            for c, t in zip(el.changes, _step_times(el.step_sent_s, el.step_done_s)[1:]) if c >= 0]
+    lag = float(np.median(lags)) if lags else 0.0
+    missing = 0
+    for el in els:
+        times = _step_times(el.step_sent_s, el.step_done_s)[1:]
+        for j in np.flatnonzero(el.changes < 0):
+            k = int(round((times[j] + lag) / el.dt_s))
+            if 0 < k < el.n:
+                el.changes[j] = k
+            missing += 1
+    if missing:
+        notes.append(f"{missing} voltage change(s) not seen in the trace, placed from the step times")
+    cut = [el for el in els if el.n < el.n_file]
+    if cut:
+        lost = max(el.n_file - el.n for el in cut)
+        notes.append(f"{len(cut)} capture(s) end early (up to {lost} of {cut[0].n_file} points, "
+                     f"{lost * cut[0].dt_s:.3g} s, never measured: read before the sweep finished)")
+    return notes
 
 
 def _describe_transient(ds: Dataset) -> str:
     counts = ", ".join(f"{sum(k[0] == d for k in ds.elements)} {d}" for d in ds.densities)
     el = next(iter(ds.elements.values()))
     prof = ", ".join(f"{v:g}" for v in (ds.profile_v if ds.profile_v is not None else el.voltages_v))
-    dt_ms = el.dt_s * 1e3
     text = (f"Transient run: {counts} elements, profile {prof} V, hold {el.hold_s:g} s, "
-            f"CW {el.freq_hz / 1e9:g} GHz, {el.n} samples every {dt_ms:.3g} ms")
+            f"CW {el.freq_hz / 1e9:g} GHz, {el.n} samples every {el.dt_s * 1e3:.4g} ms")
     if ds.skipped:
         text += f"; skipped {len(ds.skipped)} file(s)"
     for note in ds.notes:
@@ -834,21 +994,31 @@ def _describe_transient(ds: Dataset) -> str:
     return text
 
 
+def _hold_bounds(el: TransientElement) -> list[tuple[int, int]]:
+    """Sample range [start, stop) of each step: from its detected change to the next one."""
+    edges = [0] + [int(c) if c >= 0 else -1 for c in (el.changes if el.changes is not None else [])] + [el.n]
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+
 def _settled_windows(el: TransientElement, ts: TransientSettings) -> list[tuple[int, int] | None]:
     """Sample range [a, b) averaged for each step's settled phase, or None if the hold is too
-    short (or missing from the capture)."""
-    dt, n, sent = el.dt_s, el.n, el.step_sent_s
+    short (or its change wasn't found). b is the step's update start (see the notes above); the
+    last step has no update after it, so only guard_pct applies."""
+    update_s = np.clip(el.step_done_s - el.step_sent_s, 0, None) if el.step_done_s.shape == el.step_sent_s.shape \
+        else np.zeros(len(el.voltages_v))
     out = []
-    for i in range(len(sent)):
-        start = int(np.ceil(sent[i] / dt - 1e-9))
-        end_t = sent[i + 1] if i + 1 < len(sent) else sent[i] + el.hold_s
-        stop = min(int(np.floor(end_t / dt + 1e-9)), n)
+    for i, (start, stop) in enumerate(_hold_bounds(el)):
         length = stop - start
-        guard = int(round(ts.guard_pct / 100 * length))
+        if start < 0 or stop < 0 or length < MIN_SETTLE_SAMPLES:
+            out.append(None)
+            continue
+        guard = ts.guard_pct / 100 * length
+        if stop < el.n and i + 1 < len(update_s):   # a change follows: keep clear of its update
+            guard = max(guard, min((float(update_s[i + 1]) + UPDATE_MARGIN_S) / el.dt_s, 0.5 * length))
         width = max(MIN_SETTLE_SAMPLES, int(round(ts.settle_pct / 100 * length)))
-        b = stop - guard
+        b = stop - int(round(guard))
         a = max(start, b - width)
-        out.append((a, b) if start >= 0 and b - a >= MIN_SETTLE_SAMPLES else None)
+        out.append((a, b) if b - a >= MIN_SETTLE_SAMPLES else None)
     return out
 
 
@@ -874,17 +1044,17 @@ def _crossing(x: np.ndarray, k: int, centre: float, tol: float) -> float:
 
 def transition_time(el: TransientElement, index: int, ts: TransientSettings) -> TransitionResult:
     """Transition time for the change from step `index` to `index + 1` (see the notes above)."""
-    if index + 1 >= len(el.voltages_v) or index + 1 >= len(el.step_sent_s):
+    if index + 1 >= len(el.voltages_v) or el.changes is None or index >= len(el.changes):
         return TransitionResult("no_step")
     phases, wins = settled_phases(el, ts)
     dt = el.dt_s
-    command = float(el.step_sent_s[index + 1])
+    change = float(el.changes[index] * dt) if el.changes[index] >= 0 else float("nan")
     w_from, w_to = wins[index], wins[index + 1]
     if w_from is None or w_to is None:
-        return TransitionResult("short_hold", command_s=command)
+        return TransitionResult("short_hold", change_s=change)
     pa, pb = float(phases[index]), float(phases[index + 1])
     tol = ts.tolerance_pct / 100 * abs(pb - pa)
-    common = dict(phase_from=pa, phase_to=pb, tol_deg=tol, command_s=command,
+    common = dict(phase_from=pa, phase_to=pb, tol_deg=tol, change_s=change,
                   window_from=(w_from[0] * dt, w_from[1] * dt), window_to=(w_to[0] * dt, w_to[1] * dt))
     if abs(pb - pa) <= 2 * tol:   # only when the change is zero, since tolerance_pct < 50
         return TransitionResult("small_step", **common)
@@ -894,11 +1064,18 @@ def transition_time(el: TransientElement, index: int, ts: TransientSettings) -> 
     arrive = int(outside_end[-1]) + 1 if outside_end.size else 0
     if arrive >= len(x):
         return TransitionResult("not_settled", **common)
-    inside_start = np.flatnonzero(np.abs(x[:arrive] - pa) <= tol)
-    if inside_start.size == 0:
+    if el.changes[index] < 0:
         return TransitionResult("no_start", **common)
-    depart = int(inside_start[-1])
-    t_dep = (lo + _crossing(x, depart, pa, tol)) * dt
+    from_k = int(el.changes[index]) - lo   # the detected change
+    if not 0 <= from_k < arrive:
+        return TransitionResult("no_start", **common)
+    if abs(x[from_k] - pa) > tol:   # already out of the start band (controller update): start at the change
+        common["offset_at_change_deg"] = float(x[from_k] - pa)
+        t_dep = (lo + from_k) * dt
+    else:
+        outside_start = np.flatnonzero(np.abs(x[from_k:arrive] - pa) > tol)
+        depart = from_k + int(outside_start[0]) - 1   # last sample inside; crossing is between it and the next
+        t_dep = (lo + _crossing(x, depart, pa, tol)) * dt
     t_arr = (lo + _crossing(x, arrive - 1, pb, tol)) * dt
     return TransitionResult("ok", time_s=max(t_arr - t_dep, 0.0), depart_s=t_dep, arrive_s=t_arr, **common)
 

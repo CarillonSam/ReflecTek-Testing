@@ -460,7 +460,16 @@ class AnalysisTab(ttk.Frame):
                 self._queue.put(("error", f"{type(e).__name__}: {e}"))
 
         threading.Thread(target=worker, daemon=True).start()
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
+
+    def shutdown(self) -> None:
+        """Called when the window closes: cancels the pending poll of a background load."""
+        job, self._poll_job = getattr(self, "_poll_job", None), None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
 
     def _poll(self) -> None:
         try:
@@ -481,7 +490,7 @@ class AnalysisTab(ttk.Frame):
                 return
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        self._poll_job = self.after(100, self._poll)
 
     def _loaded(self, raw: analysis.Dataset, ds: analysis.Dataset, processed: dict, settings: AnalysisSettings,
                 ref_raw: analysis.Dataset | None = None) -> None:
@@ -1094,7 +1103,8 @@ def _draw_transient(fig, el, trans, result, ts, zoom: bool = False) -> None:
             x0, x1 = result.depart_s - pad, result.arrive_s + pad
         else:   # nothing measured: show the change itself and what follows it
             mid = result.change_s if np.isfinite(result.change_s) else result.window_from[1]
-            x0, x1 = mid - 0.1 * el.hold_s, mid + 0.5 * el.hold_s
+            hold = float(el.hold_s[min(trans.index + 1, len(el.hold_s) - 1)]) if trans is not None else float(np.max(el.hold_s))
+            x0, x1 = mid - 0.1 * hold, mid + 0.5 * hold
         ax_p.set_xlim(x0, x1)
         visible = (t >= x0) & (t <= x1)
         for ax, y in ((ax_p, el.phase_deg), (ax_m, el.mag_db)):

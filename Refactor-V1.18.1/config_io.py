@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import (
     PiControllerConfig, PixelControllerConfig, RunConfig, SaveConfig,
-    ScanGeometryConfig, StageConfig, VNAConfig,
+    ScanGeometryConfig, StageConfig, TransientConfig, VNAConfig,
 )
 
 # Fields that are Path (or Path | None) and need str(...)/Path(...) conversion for JSON.
@@ -20,6 +20,7 @@ _PATH_FIELDS = {
 # Fields that are tuples in the dataclass; JSON round-trips them as lists.
 _TUPLE_FIELDS = {
     PiControllerConfig: {"hb_shape", "lb_shape"},
+    TransientConfig: {"voltages_v", "hold_s"},   # hold_s may also be a single number, kept as is
 }
 
 _SUBCONFIGS = {
@@ -27,6 +28,7 @@ _SUBCONFIGS = {
     "pixels": PixelControllerConfig,
     "pi": PiControllerConfig,
     "vna": VNAConfig,
+    "transient": TransientConfig,   # presets before V1.18.1 have none: transient defaults apply
     "geometry": ScanGeometryConfig,
     "save": SaveConfig,
 }
@@ -55,7 +57,7 @@ def _sub_from_dict(cls, data: dict):
         value = data[f.name]
         if f.name in path_fields and value is not None:
             value = Path(value)
-        elif f.name in tuple_fields and value is not None:
+        elif f.name in tuple_fields and isinstance(value, list):
             value = tuple(value)
         kwargs[f.name] = value
     return cls(**kwargs)

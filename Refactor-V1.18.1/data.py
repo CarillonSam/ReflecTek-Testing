@@ -35,8 +35,8 @@ with the whole capture:
   dt_source              "instrument" (the VNA's reported sweep time) or an estimate, if it wouldn't say
   freq_hz, ifbw_hz       CW frequency and IF bandwidth
   voltages_v     (S,)    the profile, in order
-  hold_s                 the planned hold per step
-  step_planned_s (S,)    when each change was due: i * hold_s after the trigger
+  hold_s         (S,)    each step's planned hold (one number for every step in files before V1.18.1)
+  step_planned_s (S,)    when each change was due after the trigger: the running total of the holds before it
   step_sent_s    (S,)    when each change was sent to the board, from the trigger (PC clock)
   step_done_s    (S,)    when the board controller returned from it
   applied_v      (S,)    what the controller reports this element was set to at each step

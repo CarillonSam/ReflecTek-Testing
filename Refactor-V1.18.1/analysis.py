@@ -687,7 +687,7 @@ class TransientElement:
     phase_deg: np.ndarray       # (n,) raw S11 phase, unwrapped in time (measured samples only)
     mag_db: np.ndarray          # (n,) raw |S11| in dB
     voltages_v: np.ndarray      # (S,) the profile
-    hold_s: float
+    hold_s: np.ndarray          # (S,) each step's planned hold (files before V1.18.1 saved one number for all)
     step_sent_s: np.ndarray     # (S,) when each change was sent, from the trigger (PC clock)
     step_done_s: np.ndarray     # (S,) when the controller returned
     applied_v: np.ndarray | None
@@ -802,9 +802,9 @@ def _step_times(sent: np.ndarray, done: np.ndarray) -> np.ndarray:
     return done if done.shape == sent.shape and np.isfinite(done).all() else sent
 
 
-def _find_changes(s11: np.ndarray, dt: float, hold_s: float, times: np.ndarray) -> np.ndarray:
+def _find_changes(s11: np.ndarray, dt: float, hold_s: np.ndarray, times: np.ndarray) -> np.ndarray:
     """Sample index where each change (step 1 onwards) starts, -1 if not found. Each is looked
-    for within CHANGE_SEARCH of a hold around where it's expected, from the previous change and
+    for within CHANGE_SEARCH of the hold before it around where it's expected, from the previous change and
     the PC-clock spacing, using the interval measured so far once two have been found. The
     change is the biggest jump |s11[k] - s11[k - lag]| there, walked back to where that jump
     first rose above the noise before it (a backward difference, so it rises at the change
@@ -818,7 +818,7 @@ def _find_changes(s11: np.ndarray, dt: float, hold_s: float, times: np.ndarray) 
     found_k, found_t = [], []
     prev_k, prev_t, dt_cur = 0.0, 0.0, dt
     for i in range(1, len(times)):
-        hold_n = max(hold_s, times[i] - times[i - 1]) / dt_cur
+        hold_n = max(float(hold_s[i - 1]), times[i] - times[i - 1]) / dt_cur
         expected = prev_k + (times[i] - prev_t) / dt_cur
         lo = int(max(prev_k + CHANGE_SEARCH * hold_n if found_k else lag, expected - CHANGE_SEARCH * hold_n))
         hi = int(min(n, expected + CHANGE_SEARCH * hold_n))
@@ -854,6 +854,20 @@ def _interval_from_changes(el: TransientElement) -> float:
     return slope if slope > 0 else float("nan")
 
 
+def _holds(z, keys, steps: int, sent: np.ndarray) -> np.ndarray:
+    """Each step's planned hold: saved per step since V1.18.1, as one number for every step
+    before that; without either, from the spacing of the step times."""
+    if "hold_s" in keys:
+        h = np.asarray(z["hold_s"], dtype=float).ravel()
+        if h.size == steps:
+            return h
+        if h.size == 1:
+            return np.full(steps, float(h[0]))
+    gaps = np.diff(sent)
+    last = float(np.median(gaps)) if gaps.size else 0.0
+    return np.append(gaps, last)[:steps] if steps else np.zeros(0)
+
+
 def load_transient_element(path: str) -> TransientElement:
     name = os.path.basename(path)
     with np.load(path) as z:
@@ -883,7 +897,7 @@ def load_transient_element(path: str) -> TransientElement:
         voltages = np.asarray(z["voltages_v"], dtype=float).ravel()
         sent = np.asarray(z["step_sent_s"], dtype=float).ravel()
         done = np.asarray(z["step_done_s"], dtype=float).ravel() if "step_done_s" in keys else sent.copy()
-        hold = float(z["hold_s"]) if "hold_s" in keys else (float(np.median(np.diff(sent))) if sent.size > 1 else 0.0)
+        hold = _holds(z, keys, voltages.size, sent)
         dt = float(z["dt_s"])
         return TransientElement(
             density, row, col, name, position, dt,
@@ -985,7 +999,9 @@ def _describe_transient(ds: Dataset) -> str:
     counts = ", ".join(f"{sum(k[0] == d for k in ds.elements)} {d}" for d in ds.densities)
     el = next(iter(ds.elements.values()))
     prof = ", ".join(f"{v:g}" for v in (ds.profile_v if ds.profile_v is not None else el.voltages_v))
-    text = (f"Transient run: {counts} elements, profile {prof} V, hold {el.hold_s:g} s, "
+    holds = (f"hold {el.hold_s[0]:g} s" if np.unique(el.hold_s).size <= 1
+             else "holds " + ", ".join(f"{h:g}" for h in el.hold_s) + " s")
+    text = (f"Transient run: {counts} elements, profile {prof} V, {holds}, "
             f"CW {el.freq_hz / 1e9:g} GHz, {el.n} samples every {el.dt_s * 1e3:.4g} ms")
     if ds.skipped:
         text += f"; skipped {len(ds.skipped)} file(s)"

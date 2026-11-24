@@ -170,12 +170,15 @@ class SaveConfig:
 class TransientConfig:
     """
     Transient scan (scan_type "transient"): at every point, one continuous CW capture of S11
-    at freq_hz while the board steps through voltages_v, holding each for hold_s. The capture
-    covers len(voltages_v) * hold_s; its sample interval is about 1 / ifbw_hz + sample_overhead_s,
-    and the VNA allows at most max_points samples, so a long profile needs a low IF bandwidth.
+    at freq_hz while the board steps through voltages_v, holding voltages_v[i] for hold_s[i]
+    (one number holds every voltage that long). The capture covers the sum of the holds; its
+    sample interval is about 1 / ifbw_hz + sample_overhead_s, and the VNA allows at most
+    max_points samples, so a long profile needs a low IF bandwidth.
     """
     voltages_v: Sequence[float] = (0.0, 10.0, 0.0)   # the profile, applied in order at every point
-    hold_s: float = 1.0          # how long each voltage is held
+    # How long each voltage is held: one number for all of them, or one per voltage, in the same
+    # order (voltages 1, 2, 3 with holds 20, 30, 10 = 20 s at 1 V, 30 s at 2 V, 10 s at 3 V).
+    hold_s: float | Sequence[float] = 1.0
     freq_hz: float = 19.3e9      # CW frequency
     ifbw_hz: float = 1000.0      # IF bandwidth: sets the sample rate
     max_points: int = 16001      # the VNA's limit on points per CW capture
@@ -186,9 +189,42 @@ class TransientConfig:
     read_margin_s: float = 2.0   # extra wait after the capture should have ended, before reading it
     sample_overhead_s: float = 0.1111111e-3   # per-sample overhead on top of 1 / ifbw_hz (estimate only)
 
+    def holds_s(self) -> tuple[float, ...]:
+        """Each step's hold, one per voltage (a single number is used for every step). Raises
+        ValueError if the counts don't match; see hold_error()."""
+        n = len(self.voltages_v)
+        holds = tuple(float(h) for h in self.hold_s) if isinstance(self.hold_s, (list, tuple)) \
+            else (float(self.hold_s),)
+        if len(holds) == 1:
+            return holds * n
+        if len(holds) != n:
+            raise ValueError(f"{len(holds)} hold times for {n} voltages: give one per voltage, or one for all")
+        return holds
+
+    def hold_error(self) -> str:
+        """Why the holds can't be used with this profile, or "" if they can."""
+        try:
+            holds = self.holds_s()
+        except (TypeError, ValueError) as e:
+            return str(e)
+        if not holds:
+            return "no hold times"
+        if any(not h > 0 for h in holds):
+            return "every hold time must be greater than 0"
+        return ""
+
+    def step_starts_s(self) -> tuple[float, ...]:
+        """When each voltage is due, from the start of the capture: 0, then the running total
+        of the holds before it."""
+        starts, t = [], 0.0
+        for h in self.holds_s():
+            starts.append(t)
+            t += h
+        return tuple(starts)
+
     @property
     def duration_s(self) -> float:
-        return len(self.voltages_v) * self.hold_s
+        return float(sum(self.holds_s()))
 
     def estimated_points(self) -> int:
         """Samples needed to cover the profile, from the estimated sample interval (the VNA's

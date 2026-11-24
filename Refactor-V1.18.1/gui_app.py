@@ -78,6 +78,11 @@ class ScanApp(tk.Tk):
 
     def _on_close(self) -> None:
         self.scan_tab.release_manual_hardware()
+        # Cancel the tabs' pending polling timers first: otherwise, where Tk events keep being
+        # processed after the window is gone (e.g. running from Spyder or IPython), one fires and
+        # reports 'invalid command name "..._poll_queue"'.
+        self.scan_tab.shutdown()
+        self.analysis_tab.shutdown()
         self.destroy()
 
 

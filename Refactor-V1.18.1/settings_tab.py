@@ -135,11 +135,34 @@ class ScrollableFrame(ttk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        self._canvas = canvas
+
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            self.scroll_wheel(event)
 
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+    def scroll_wheel(self, event) -> str:
+        """Scrolls the page by one mouse-wheel notch. Returns "break" so a widget that binds this
+        doesn't also handle the wheel itself."""
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def wheel_scrolls_page_over_dropdowns(self) -> None:
+        """A read-only ttk.Combobox changes its value when the mouse wheel turns over it, without
+        firing <<ComboboxSelected>>, so scrolling the page past one silently changed a setting
+        (e.g. Density to scan or L sub-grid, noticed only when the Scan tab's preview redrew).
+        Over every dropdown in the page, the wheel now scrolls the page instead; clicking and
+        choosing work as before."""
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Combobox):
+                    child.bind("<MouseWheel>", self.scroll_wheel)
+                    child.bind("<Button-4>", lambda e: "break")   # X11 wheel events
+                    child.bind("<Button-5>", lambda e: "break")
+                walk(child)
+        walk(self.body)
 
 
 class SettingsTab(ttk.Frame):
@@ -177,6 +200,7 @@ class SettingsTab(ttk.Frame):
         self._advanced_visible = False
 
         self.actions_frame = self._build_actions(body)
+        scroller.wheel_scrolls_page_over_dropdowns()   # after every dropdown exists, advanced ones included
 
         self.set_config(self._template)
 
@@ -279,7 +303,7 @@ class SettingsTab(ttk.Frame):
         self._transient_rows = []
         for label, key, kind, hint in (
                 ("Voltage profile (V)", "transient.voltages_v", "voltages", "in order, e.g. 0, 10, 0"),
-                ("Hold time (s)", "transient.hold_s", "float", "each voltage, in one continuous capture"),
+                ("Hold time (s)", "transient.hold_s", "voltages", "one per voltage, in the same order (e.g. 20, 30, 10), or one for all"),
                 ("CW frequency (Hz)", "transient.freq_hz", "float", None),
                 ("IF bandwidth (Hz)", "transient.ifbw_hz", "float", "sets the sample rate")):
             self._transient_rows += self._add_field(frame, r, label, key, kind, hint=hint, on_change=tr); r += 1
@@ -327,15 +351,18 @@ class SettingsTab(ttk.Frame):
 
     def _transient_from_form(self, errors: list[str]) -> TransientConfig:
         t = replace(self._template.transient, **self._collect("transient", TransientConfig, errors))
-        if t.hold_s <= 0:
-            errors.append("Hold time must be greater than 0")
+        if isinstance(t.hold_s, (list, tuple)) and len(t.hold_s) == 1:
+            t = replace(t, hold_s=float(t.hold_s[0]))   # one number: the same hold for every voltage
+        hold_problem = t.hold_error()
+        if hold_problem:
+            errors.append(f"Hold time: {hold_problem}")
         if t.ifbw_hz <= 0:
             errors.append("IF bandwidth must be greater than 0")
         if t.freq_hz <= 0:
             errors.append("CW frequency must be greater than 0")
         if t.max_points < 2:
             errors.append("transient.max_points must be at least 2")
-        if not errors and t.estimated_points() > t.max_points:
+        if not errors and not hold_problem and t.estimated_points() > t.max_points:
             errors.append(f"The transient profile ({t.duration_s:g} s) needs about {t.estimated_points()} points at "
                           f"{t.ifbw_hz:g} Hz IF bandwidth, more than the VNA's {t.max_points}: use a lower IF "
                           "bandwidth, shorter holds or fewer steps")
@@ -352,8 +379,11 @@ class SettingsTab(ttk.Frame):
             return
         dt_ms = 1e3 * (1.0 / t.ifbw_hz + t.sample_overhead_s)
         longest = t.max_points * dt_ms / 1e3
+        holds = t.holds_s()
+        steps = (f"{len(holds)} steps x {holds[0]:g} s" if len(set(holds)) == 1
+                 else " + ".join(f"{h:g} s at {v:g} V" for v, h in zip(t.voltages_v, holds)))
         self.transient_summary.configure(foreground="gray30", text=(
-            f"Each point: {len(t.voltages_v)} steps x {t.hold_s:g} s = one {t.duration_s:g} s capture, about "
+            f"Each point: {steps} = one {t.duration_s:g} s capture, about "
             f"{t.estimated_points()} of the VNA's {t.max_points} points, one every {dt_ms:.3f} ms "
             f"(at most {longest:.1f} s at this IF bandwidth)."))
 
@@ -647,7 +677,10 @@ class SettingsTab(ttk.Frame):
             obj = config
             for part in key.split("."):
                 obj = getattr(obj, part)
-            self.vars[key].set(", ".join(_fmt("float", v) for v in obj) if kind == "voltages" else _fmt(kind, obj))
+            if kind == "voltages" and isinstance(obj, (list, tuple)):
+                self.vars[key].set(", ".join(_fmt("float", v) for v in obj))
+            else:   # incl. a single hold time, which is one number rather than a list
+                self.vars[key].set(_fmt("float" if kind == "voltages" else kind, obj))
 
         self.vars["geo_stagger_mirror"].set(config.geometry.stagger_sign < 0)
         self.controller_type_var.set(config.controller_type)

@@ -193,8 +193,8 @@ class VNAController(VNAInstrument):
     # ---------------------------------------------------------------- CW capture ----
 
     def setup_cw(self, transient: TransientConfig) -> None:
-        """Puts the VNA in CW mode for one capture long enough for the whole profile
-        (len(voltages_v) * hold_s). If the VNA's own sweep time comes out shorter than that,
+        """Puts the VNA in CW mode for one capture long enough for the whole profile (the sum
+        of the holds, transient.duration_s). If the VNA's own sweep time comes out shorter than that,
         the point count is raised to cover it, up to transient.max_points."""
         self._ensure_open()
         logging.info("VNA identified as: %s", self.instr.query("*IDN?").strip())

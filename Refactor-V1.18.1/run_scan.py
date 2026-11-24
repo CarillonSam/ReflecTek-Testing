@@ -95,8 +95,10 @@ class AutomatedArrayScanner:
         self.off_target_points: list[ScanPoint] = []        # measured anyway after a timeout
         if config.scan_type == "transient":
             t = config.transient
-            if not len(t.voltages_v) or t.hold_s <= 0 or t.ifbw_hz <= 0:
-                raise ValueError("A transient scan needs at least one voltage, a hold time above 0 and an IF bandwidth above 0.")
+            if not len(t.voltages_v) or t.ifbw_hz <= 0:
+                raise ValueError("A transient scan needs at least one voltage and an IF bandwidth above 0.")
+            if t.hold_error():
+                raise ValueError(f"Transient hold times: {t.hold_error()}.")
             if t.estimated_points() > t.max_points:
                 raise ValueError(f"The {t.duration_s:g} s profile needs about {t.estimated_points()} points at "
                                  f"{t.ifbw_hz:g} Hz IF bandwidth, more than the VNA's {t.max_points}.")
@@ -545,13 +547,14 @@ class AutomatedArrayScanner:
         t = self.config.transient
         voltages = np.asarray(t.voltages_v, dtype=float)
         n = len(voltages)
-        planned = np.arange(n) * t.hold_s
+        holds = np.asarray(t.holds_s(), dtype=float)
+        planned = np.asarray(t.step_starts_s(), dtype=float)   # each change, from the trigger
         sent, finished, applied = np.zeros(n), np.zeros(n), np.full(n, np.nan)
         points, dt = capture["points"], capture["dt_s"]
 
         if self.config.dry_run:
-            logging.info("[DRY RUN] transient at %s row %d col %d: profile %s V, %g s holds",
-                         point.density, point.logical_row, point.logical_col, list(voltages), t.hold_s)
+            logging.info("[DRY RUN] transient at %s row %d col %d: profile %s V, holds %s s",
+                         point.density, point.logical_row, point.logical_col, list(voltages), list(holds))
             s11 = np.zeros(points, dtype=np.complex128)
             sent[:], finished[:], applied[:] = planned, planned, voltages
             trigger_time = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -579,20 +582,28 @@ class AutomatedArrayScanner:
             "s11": s11, "time_s": np.arange(points) * dt, "dt_s": np.float64(dt),
             "sweep_time_s": np.float64(capture["sweep_time_s"]), "dt_source": np.str_(capture["dt_source"]),
             "freq_hz": np.float64(t.freq_hz), "ifbw_hz": np.float64(t.ifbw_hz),
-            "voltages_v": voltages, "hold_s": np.float64(t.hold_s),
+            "voltages_v": voltages, "hold_s": holds,
             "step_planned_s": planned, "step_sent_s": sent, "step_done_s": finished, "applied_v": applied,
             "trigger": np.str_(t.trigger), "trigger_time": np.str_(trigger_time),
         }
 
 
+SPIN_S = 0.02   # the last this-many seconds before a deadline are spent checking the clock, not sleeping
+
+
 def _wait_until(deadline: float) -> None:
-    """Sleeps until time.perf_counter() reaches deadline, in short naps so it isn't late by
-    more than the OS's sleep granularity."""
+    """Waits until time.perf_counter() reaches deadline. time.sleep() can't wake sooner than the
+    OS timer allows and often wakes late (up to about 16 ms on Windows), so it sleeps only until
+    SPIN_S before the deadline and then checks the clock in a tight loop for the rest: on time to
+    a fraction of a millisecond, at the cost of keeping one CPU core busy for at most SPIN_S per
+    wait. Deadlines are absolute (from the trigger), so lateness never adds up across steps."""
     while True:
         remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            return
-        time.sleep(min(remaining, 0.005))
+        if remaining <= SPIN_S:
+            break
+        time.sleep(min(remaining - SPIN_S, 0.5))
+    while time.perf_counter() < deadline:
+        pass
 
 
 class _PiGridRecord:

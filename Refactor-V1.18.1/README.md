@@ -29,7 +29,7 @@ fixes bump PATCH.
   `openpyxl`), checked against `Pixel_Map_by_ConnRow.csv`; see "Element addressing" below
 - `pinout_32x32.xlsx` — the board pinout: element names, pins and MUX words
 - `Pixel_Map_by_ConnRow.csv` — the controller's wiring table (index, connector, pin, MUX word, DAC select)
-- `config_io.py` — RunConfig <-> JSON (for saving/loading GUI presets)
+- `config_io.py` — RunConfig <-> JSON (for saving/loading GUI presets; includes the transient settings since V1.18.1)
 - `branding.py` — app name ("Candice") and the kiss-mark logo loader
 - `kiss_mark.png` — the logo image (40x35, transparent background)
 - `settings_tab.py` — GUI tab 1: Settings & Configuration (`SettingsTab`)
@@ -81,6 +81,15 @@ expect both present) filled with zeros, sized by its own `hb_shape`/`lb_shape`
 (`(rows, cols)`, independent of the active band's shape, since the two bands can be
 physically different sizes). **`hb_shape`/`lb_shape` are placeholder values (`(24, 8)`)
 and need real numbers before trusting this.**
+
+**Whole-board voltages (V1.18.1).** When every element gets the same voltage (uniform-board
+sweeps, and each step of a uniform-board transient scan), `PiBoardController.set_uniform_voltage`
+fills **both** files with that voltage at their full configured sizes: the HB file at `hb_shape`,
+the LB file at `lb_shape`, whatever grid is being scanned. The voltage is clipped to
+`min_voltage_v`/`max_voltage_v` as usual, and a shape that isn't two positive numbers is refused.
+Single-pixel scans and voltage patterns are unchanged: they still write the scanned grid to the
+active band's file and zeros to the other. This makes `hb_shape`/`lb_shape` matter for every
+uniform scan, so they must match what the Pi's DAC script expects.
 
 **Naming collision worth being careful about:** this project's `ScanGeometryConfig.density_mode`
 uses `"L"`/`"H"` for a completely different concept (low/high density — which of the 3
@@ -160,6 +169,22 @@ custom values in every section round-trip through every widget exactly, the band
 right sweep and syncs `pi.active_band`, validation reports all problems together, the live preview
 hook fires for geometry fields in both sections, presets save and reload, and a dry-run scan started
 from the Scan tab's Start button runs to 100%.
+
+### Two GUI fixes (V1.18.1)
+
+- **Dropdowns no longer change when the page is scrolled.** A read-only dropdown (ttk.Combobox)
+  steps to its next value when the mouse wheel turns over it, without firing its "selected"
+  event. So scrolling the Settings page past **Density to scan** or **L sub-grid** could silently
+  change them, which only showed when the Scan tab's preview redrew on switching tabs. All 8 of
+  the Settings tab's dropdowns (band, board controller, scan type and the rest, advanced ones
+  included) were affected. Over a dropdown, the wheel now scrolls the page instead; clicking and
+  choosing work as before.
+- **No 'invalid command name "..._poll_queue"' on closing.** While a scan runs, the Scan tab checks
+  for progress every 100 ms with an `after()` timer. Closing the window left that timer pending,
+  and anything that keeps processing Tk events after the window is gone (running from Spyder,
+  IPython or an editor's interactive window) then fired it and reported the error. Closing now
+  cancels the Scan tab's and Analysis tab's pending timers first. Closing mid-scan still stops the
+  scan where it is (resume it later).
 
 ## Scan tab
 
@@ -441,12 +466,16 @@ the scan:
 4. reads the capture back and saves it, then moves on to the next point.
 
 **Settings.** General: **Voltage profile** (in order, e.g. `0, 10, 0` or `0, 5, 10, 5, 0`),
-**Hold time** (per voltage), **CW frequency** and **IF bandwidth**. Below them, a line shows the
-capture this gives (length, points, sample interval) against the VNA's limit. Advanced > Transient
+**Hold time**, **CW frequency** and **IF bandwidth**. Hold time takes one number per voltage, in
+the same order, or one number for all of them (V1.18.1). With voltages `1, 2, 3` and hold times
+`20, 30, 10`, each point's capture is 60 s: 20 s at 1 V, then 30 s at 2 V, then 10 s at 3 V. A list
+whose length doesn't match the profile, or a hold of 0 or less, is refused with a message. Below
+them, a line shows the capture this gives (each step, the total length, points, sample interval)
+against the VNA's limit. Advanced > Transient
 scan: `trigger` (`usb`, a pulse on `trigger_port` wired to the VNA's external trigger, as in
 vna_cw_s11_capture.py; or `software`, over VISA), `trigger_port`, `max_points` (the VNA's CW point
 limit, 16001), `read_margin_s` (extra wait before reading each capture) and `sample_overhead_s`
-(used only for the estimate). The capture covers (number of steps) x (hold time); its sample
+(used only for the estimate). The capture covers the sum of the hold times; its sample
 interval is about 1 / IF bandwidth, so a long profile needs a low IF bandwidth: at 1 kHz,
 16001 points last about 17.8 s; at 200 Hz, about 82 s. Settings, the scan and the VNA each refuse
 a profile that doesn't fit. The board settle time isn't used: the holds are the waits.
@@ -460,8 +489,16 @@ is refused rather than saved, since `dt_s` would then be wrong for it. Each volt
 timed on the PC (`step_sent_s` when it was sent, `step_done_s` when the controller returned), from
 the moment just before the trigger was sent. The VNA's own delay between trigger and first sample
 is therefore one constant shift for every step of every point: a change appears in the trace at
-its recorded time minus that delay. Changes are sent as close to their planned time
-(`step_planned_s` = i x hold) as the PC's sleep allows, and the actual times are what's recorded.
+its recorded time minus that delay. Each change is scheduled at an absolute deadline from the
+trigger (`step_planned_s`, the running total of the holds), so a late step never pushes the later
+ones back. Since V1.18.1 the wait sleeps only until 20 ms before the deadline and checks the clock
+for the rest, because `time.sleep()` can wake up to about 16 ms late on Windows. Changes are sent
+within a fraction of a millisecond of their deadline, at the cost of one CPU core kept busy for up
+to 20 ms per step. The actual times are what's recorded. With the Pi controller this isn't the main
+lag: its update (stop the program, wait `stop_settle_s`, upload, restart) applies the new voltage
+about 1.2-1.4 s after it is sent, and a hold shorter than that can't be met (the next change is
+then sent late; the log says by how much). In a stand-in test with a 1.2 s board update and holds
+of 2, 3 and 1 s, every change was sent within 0.04 ms of its deadline.
 Tested against a simulated VNA whose samples follow the board voltage: the edges in the saved
 trace matched the recorded step times to within one sample, plus the constant trigger delay, with
 the VNA both slower and faster than the estimate, with both trigger types, and across a resume.
@@ -505,12 +542,39 @@ voltage aren't changes and aren't listed. Correction, phase reference and refere
 out: a CW capture has one frequency, so there's nothing to gate or calibrate, and everything shown
 is the raw S11 at the CW frequency.
 
-**Heatmap: transition time (ms)** for the chosen change, at every element. For the change from
-step i to step i + 1:
+**Loading cleans up the capture first** (checked against the sample run
+`2026-11-19_ID5_Center_TR_10V`, 6 L elements, profile 0, 10, 0 V, 50 s holds, Pi controller):
+
+- **Unmeasured tail dropped.** If the VNA is read before its sweep has finished, the points not yet
+  measured come back as exactly 1+0j (0 dB, 0 deg). That run of filler at the end is cut off. In the
+  sample run, every capture ended 676 of 14,836 points early.
+- **Each voltage change is found in the trace**, as the abrupt jump in S11 where the board changes,
+  searched for near where the step times put it. Holds run from one detected change to the next.
+  The PC-clock step times aren't used to place anything, because with the Pi the new voltage
+  appears about 1.1-1.4 s after the command is sent (about 0.1 s after the controller returns),
+  and that varies.
+- **Sample interval recovered.** When the file's interval is only an estimate (`dt_source` isn't
+  "instrument"), the real one is the samples between detected changes divided by the PC-clock time
+  between them (`step_done_s`), the median over the run's elements. In the sample run, the file
+  said 10.11 ms (1/IFBW plus an assumed 0.11 ms overhead), but the changes say 10.63 ms, the same
+  in all six elements to within ±0.3%. That also explains the early read (the sweep really needed
+  about 158 s, not 150 s), and that the changes appeared *before* they were sent on the old time
+  axis. An interval the VNA did report is kept, with a note if the changes disagree by more than
+  1%. With fewer than two changes in the profile it can't be checked, and the description says so.
+
+The run description (above the plots) reports all three. Detected changes sit within ±6 samples
+(±64 ms) of where each element's phase first visibly moves.
+
+**Heatmap: transition time** for the chosen change, at every element, in seconds when the typical
+time is 1 s or more, otherwise ms. For the change from step i to step i + 1:
 
 1. **Settled phase** of each step: the mean phase over the last 10% of its hold (**Settled phase:
-   last ... % of each hold**), ending 2% of the hold before the next change was sent, so the start
-   of the next change can't creep into the average.
+   last ... % of each hold**). The window ends at the step's **update start**: before the next
+   change by the controller's update time (`step_done_s - step_sent_s`) plus 1 s for the VNA's
+   trigger latency, or by 2% of the hold, whichever is longer (but at most half the hold). With the
+   Pi this matters. It stops its DAC program about a second before the new voltage arrives, and in
+   the sample run the 10 V hold drops about 1 deg 1.5-1.75 s before the 10 → 0 V change. Ending the
+   window 2% of the hold before the change let that dip into the average.
 2. **Tolerance:** 10% (**Tolerance ±**) of this transition's own phase change, the difference between
    the two settled phases, used for both bands. If 2 → 10 V takes an element from 20 to 200 deg, its
    tolerance for that transition is ±18 deg; if it goes from 2 to 20 deg, ±1.8 deg. Each element and
@@ -519,36 +583,53 @@ step i to step i + 1:
 4. **Arrival** is the last time the phase enters the end band, so it then stays inside it to the end
    of step i + 1's settled window. Overshoot or ringing that leaves the band again counts as still
    settling.
-5. **Departure** is the last time before arrival that the phase leaves the start band, through either
-   edge.
+5. **Departure** is the first time, from the detected change on, that the phase leaves the start
+   band, through either edge. Counting from the change means noise before it can't start the
+   clock. It also means a response that swings away and later passes back through the start band
+   is timed from when it first moved, not from the later pass: the sample run's 10 → 0 V falls swing
+   up about 50 deg and come back down through the start band. If the controller's update has
+   already pushed the phase out of the start band when the change arrives, the clock starts at the
+   change itself. This times the element's response to the new voltage, not the controller's
+   update, and the element view says how far off it already was.
 6. **Transition time** = arrival − departure, with both crossings interpolated between samples.
 
 The phase is unwrapped in time first, so a change through ±180 deg is measured as the continuous
-change it is. Both moments come from the same trace, so the VNA's trigger delay (and any variation
-in it) doesn't enter the result; the recorded step times are only used to find each hold, and a delay
-small next to 2% of the hold can't affect the settled phases either. Elements show grey, with the
-reason in the element view, when the phase never stays inside the end band, when a hold is too short
-to average, or when the two settled phases are identical (no change to time). Because the bands
-scale with the change, they never overlap. **Small changes get narrow bands, so phase noise
-matters:** once the band is not much wider than the noise, the last noise spike outside it sets
-the arrival, and the time comes out too long (or the element goes grey). Check small transitions'
-element views before trusting their times. Changing either percentage
-recomputes the map (about 0.2 s for 2048 elements; results are cached). The colour scale is the
-usual one, ending at red so the top of the scale can't be mistaken for grey.
+change it is. Both moments come from the same trace, so the VNA's trigger delay doesn't enter the
+result. Elements show grey, with the reason in the element view, when the phase never stays inside
+the end band, when a hold is too short to average, when the change wasn't found, or when the two
+settled phases are identical (no change to time). Because the bands scale with the change, they
+never overlap. **Small changes get narrow bands, so phase noise and drift matter.** Once the band is
+not much wider than the noise, the last noise spike outside it sets the arrival, and the time comes
+out too long (or the element goes grey). In the sample run, the phase noise is 0.01-0.03 deg rms,
+but phases creep by up to about 1 deg over a 50 s hold, against bands of ±0.8-2.7 deg. Check small
+transitions' element views before trusting their times. Changing either percentage recomputes the
+map (about 0.2 s for 2048 elements; results are cached). The colour scale is the usual one, ending
+at red so the top of the scale can't be mistaken for grey.
 
-**Element view:** the whole capture, raw phase (unwrapped) and magnitude against time, with a dotted
-line and the voltage at each recorded change. For the chosen transition it also shows the two
-settled windows (light grey), the start and end bands (orange, green) with their phases and
-tolerance, and the measured transition (red span, departure and arrival marked). **Zoom plot to
-transition** narrows the time axis to the transition.
+Sample run results (10% bands): 0 → 10 V rises take 0.62-3.6 s; 10 → 0 V falls take 26-38 s.
+
+**Element view:** the whole measured capture, raw phase (unwrapped) and magnitude against time from
+the start of the capture, with a dotted line and the voltage at each detected change. For the chosen
+transition it also shows the two settled windows (light grey), the start and end bands (orange,
+green) with their phases and tolerance, and the measured transition (red span, departure and
+arrival marked). **Zoom plot to transition** narrows the time axis to the transition.
+
+**Acquisition side, not yet fixed:** the sample run shows the VNA takes about 0.63 ms per point beyond
+1/IFBW, not the 0.11 ms `sample_overhead_s` assumes, so the capture is read before it finishes and
+its last seconds are lost. Recovering the interval needs at least two changes per profile.
 
 Verified on synthetic runs with known answers (first-order responses with per-element rise and fall
 time constants, random phase offsets so most traces wrap through ±180 deg, a 4 ms trigger delay and
 jittered step times): every transition time, small changes included, matches τ·ln(9) (the exact
-answer for a first-order response with 10% bands) to within 0.02%, ringing is timed to its last entry into the band, and a full 2048-element
-H run of 16,200 samples per element loads in about 4 s. Tested in the real tab: switching between
-rise and fall, every transition, clicking and typed selection, zoom, invalid percentages (put back),
-and switching between transient and sweep runs.
+answer for a first-order response with 10% bands) to within 0.05%, and ringing is timed to its last
+entry into the band. A second synthetic run reproduces the sample run's problems (file interval 5%
+off and labelled an estimate, an unmeasured 1+0j tail, a 1.1-1.3 s Pi update lag, a 0.3 s trigger
+latency and a 0.8 deg dip during each update from a non-zero voltage). The interval is recovered to
+0.1%, the measured samples are kept exactly, changes are placed within 0.03 s, and all transition
+times are within 1.8%. A full 2048-element H run of 16,200 samples per element loads in about 4 s.
+Tested in the real tab with the sample run and the synthetic runs: switching between rise and fall,
+every transition, clicking and typed selection, zoom, invalid percentages (put back), and switching
+between transient and sweep runs.
 
 ## Resuming a stopped scan (V1.17.0)
 

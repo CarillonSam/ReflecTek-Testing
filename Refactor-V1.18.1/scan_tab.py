@@ -72,6 +72,9 @@ class ScanTab(ttk.Frame):
         self._polling = False
         self._scanner: AutomatedArrayScanner | None = None   # the running scan's, so STOP can reach its stage
         self._timeout_dialog = None   # (window, reply, done) while the move-timeout question is open
+        # Pending after() timers of the three polling loops, so shutdown() can cancel them: a timer
+        # that fires after the window is gone reports 'invalid command name "..._poll_queue"'.
+        self._jobs: dict[str, str] = {}
 
         # Manual controls (side panel). Hardware is connected on first use and released
         # before a scan or calibration starts (they open their own connections).
@@ -665,13 +668,13 @@ class ScanTab(ttk.Frame):
                 logging.exception("Manual control failed")
                 self._manual_queue.put(("error", f"{type(e).__name__}: {e}", done, status_label))
         threading.Thread(target=worker, daemon=True).start()
-        self.after(50, self._poll_manual)
+        self._schedule("manual", 50, self._poll_manual)
 
     def _poll_manual(self) -> None:
         try:
             kind, payload, done, status_label = self._manual_queue.get_nowait()
         except queue.Empty:
-            self.after(50, self._poll_manual)
+            self._schedule("manual", 50, self._poll_manual)
             return
         self._manual_busy = False
         if kind == "ok":
@@ -789,7 +792,7 @@ class ScanTab(ttk.Frame):
             except Exception as e:   # ValueError = can't resume; anything else is unexpected, but reported too
                 results.put(("error", e))
         threading.Thread(target=work, daemon=True).start()
-        self.after(100, self._poll_resume_check, results, Path(folder).name)
+        self._schedule("resume", 100, self._poll_resume_check, results, Path(folder).name)
 
     def _poll_resume_check(self, results: queue.Queue, name: str) -> None:
         outcome = None
@@ -799,7 +802,7 @@ class ScanTab(ttk.Frame):
         except queue.Empty:
             pass
         if outcome is None:
-            self.after(100, self._poll_resume_check, results, name)
+            self._schedule("resume", 100, self._poll_resume_check, results, name)
             return
         self._checking_resume = False
         self.start_button.configure(state="disabled" if self.emergency_stopped else "normal")
@@ -865,7 +868,7 @@ class ScanTab(ttk.Frame):
         self._scan_thread.start()
         if not self._polling:
             self._polling = True
-            self.after(100, self._poll_queue)
+            self._schedule("scan", 100, self._poll_queue)
 
     def _on_stop(self) -> None:
         if self._cancel_event is not None:
@@ -938,6 +941,20 @@ class ScanTab(ttk.Frame):
         else:
             self.status_label.configure(text="Stopping...")
 
+    def _schedule(self, loop: str, ms: int, func, *args) -> None:
+        """after(), remembering the timer as this polling loop's pending one (see shutdown())."""
+        self._jobs[loop] = self.after(ms, func, *args)
+
+    def shutdown(self) -> None:
+        """Called when the window closes: cancels the polling loops' pending timers, so none
+        fires after the widgets are gone."""
+        for job in self._jobs.values():
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._jobs.clear()
+
     def _poll_queue(self) -> None:
         finished = False
         try:
@@ -948,7 +965,7 @@ class ScanTab(ttk.Frame):
         if finished:
             self._polling = False
         else:
-            self.after(100, self._poll_queue)
+            self._schedule("scan", 100, self._poll_queue)
 
     def _handle_message(self, msg: tuple) -> bool:
         kind = msg[0]

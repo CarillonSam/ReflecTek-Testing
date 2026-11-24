@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import fields
 from pathlib import Path
 
@@ -94,10 +95,48 @@ def config_from_dict(data: dict) -> RunConfig:
 
 
 def save_config(config: RunConfig, path: str | Path) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config_to_dict(config), f, indent=2)
+    """The whole file is built first and only then written (to a temporary name, renamed over the
+    old file), so a save that fails leaves the old file untouched rather than half written."""
+    text = json.dumps(config_to_dict(config), indent=2)
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+# Before V1.18.1, saving stopped partway through, at the transient settings (this module didn't
+# know about them), leaving a file that ends with '"transient": '. Everything before that point
+# was written in full: these sections. The rest is lost.
+_CUT_OFF_AT = '"transient":'
+_KEPT_IN_CUT_OFF = "stage, board controller, Pi, VNA, scan geometry and save"
+_LOST_IN_CUT_OFF = ("voltages, scan type, board controller type, settle times, uniform-board and dry-run options, "
+                    "voltage pattern file and the transient settings")
+
+
+def load_config_checked(path: str | Path) -> tuple[RunConfig, str]:
+    """(settings, note). The note is "" for a normal file. A file cut off by the pre-V1.18.1 save
+    bug is recovered as far as it goes, and the note says what was lost (those settings are at
+    their defaults; saving again writes a complete file)."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    try:
+        return config_from_dict(json.loads(text)), ""
+    except json.JSONDecodeError:
+        stripped = text.rstrip()
+        if not stripped.endswith(_CUT_OFF_AT):
+            raise
+        head = stripped[: -len(_CUT_OFF_AT)].rstrip().rstrip(",") + "\n}"
+        try:
+            data = json.loads(head)
+        except json.JSONDecodeError:
+            raise ValueError("The file is cut off partway through and couldn't be recovered.") from None
+    band = data.get("pi", {}).get("active_band")
+    note = (f"This file was cut off when it was saved (a bug in versions before 1.18.1). Recovered: the "
+            f"{_KEPT_IN_CUT_OFF} settings" + (f", and the band ({band})" if band else "") +
+            f". Not in the file, so set to their defaults: {_LOST_IN_CUT_OFF}. Check those, then save "
+            "the settings again to write a complete file.")
+    return config_from_dict(data), note
 
 
 def load_config(path: str | Path) -> RunConfig:
-    with open(path, encoding="utf-8") as f:
-        return config_from_dict(json.load(f))
+    return load_config_checked(path)[0]

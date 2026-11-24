@@ -170,7 +170,7 @@ right sweep and syncs `pi.active_band`, validation reports all problems together
 hook fires for geometry fields in both sections, presets save and reload, and a dry-run scan started
 from the Scan tab's Start button runs to 100%.
 
-### Two GUI fixes (V1.18.1)
+### GUI fixes (V1.18.1)
 
 - **Dropdowns no longer change when the page is scrolled.** A read-only dropdown (ttk.Combobox)
   steps to its next value when the mouse wheel turns over it, without firing its "selected"
@@ -179,6 +179,15 @@ from the Scan tab's Start button runs to 100%.
   the Settings tab's dropdowns (band, board controller, scan type and the rest, advanced ones
   included) were affected. Over a dropdown, the wheel now scrolls the page instead; clicking and
   choosing work as before.
+- **Saving and loading settings work again.** Since 1.18.0, `config_io.py` didn't know about the
+  transient settings, so every **Save Settings** failed partway through and left a cut-off file
+  ending in `"transient": `. Loading such a file gave "Expecting value: line 85 column 16". Saving now
+  includes the transient settings, and builds the whole file before writing it (to a temporary name,
+  then renamed over the old one), so a failed save can never leave a broken file again. A file cut off
+  by the old bug still loads: everything before the cut is recovered (stage, board controller, Pi, VNA,
+  scan geometry and save settings, and the band), and a warning lists what was lost and set to
+  defaults (voltages, scan type, controller type, settle times and the transient settings). Check
+  those and save again to get a complete file.
 - **No 'invalid command name "..._poll_queue"' on closing.** While a scan runs, the Scan tab checks
   for progress every 100 ms with an `after()` timer. Closing the window left that timer pending,
   and anything that keeps processing Tk events after the window is gone (running from Spyder,

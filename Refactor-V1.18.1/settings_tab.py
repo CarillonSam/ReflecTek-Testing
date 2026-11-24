@@ -24,7 +24,7 @@ from config import (
     BAND_VNA_DEFAULTS, PiControllerConfig, PixelControllerConfig, RunConfig, SaveConfig,
     ScanGeometryConfig, StageConfig, TransientConfig, VNAConfig,
 )
-from config_io import load_config, save_config
+from config_io import load_config_checked, save_config
 
 BAND_LABELS = {"lb": "Low band (17-21 GHz)", "hb": "High band (26-30 GHz)"}
 BAND_FROM_LABEL = {v: k for k, v in BAND_LABELS.items()}
@@ -512,12 +512,15 @@ class SettingsTab(ttk.Frame):
         if not path:
             return
         try:
-            config = load_config(path)
+            config, note = load_config_checked(path)
         except (OSError, ValueError, KeyError, TypeError) as e:
             messagebox.showerror("Load failed", f"Could not load {path}:\n\n{e}")
             return
         self.set_config(config)
-        messagebox.showinfo("Loaded", f"Settings loaded from {path}")
+        if note:
+            messagebox.showwarning("Loaded, with settings missing", f"Loaded {path}.\n\n{note}")
+        else:
+            messagebox.showinfo("Loaded", f"Settings loaded from {path}")
 
     def _on_calibrate(self) -> None:
         """Opens the calibration walkthrough (calibration_wizard.py): stage calibration and/or
